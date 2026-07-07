@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-steamos-devkit"
+version = "0.1.0"
+description = "MCP server for SteamOS Devkit Client devices"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+  { name = "Codex" }
+]
+dependencies = [
+  "mcp>=1.0",
+  "paramiko>=3.4",
+  "platformdirs>=4.0",
+  "zeroconf>=0.132",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+mcp-steamos-devkit = "mcp_steamos_devkit.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_steamos_devkit"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
