@@ -23,8 +23,10 @@ The server is built for Windows-first SteamOS Devkit installs, but the core adap
 
 ## Quick Start
 
+Clone this repository, then run from the clone directory:
+
 ```powershell
-cd C:\Users\ellio\Documents\Codex\2026-07-07\come\outputs\mcp-steamos-devkit
+cd C:\path\to\mcp-steamos-devkit
 python -m pip install -e .[dev]
 mcp-steamos-devkit doctor
 mcp-steamos-devkit serve
@@ -45,7 +47,7 @@ $env:STEAMOS_DEVKIT_SOURCE_ROOT = 'C:\path\to\steamos-devkit'
 Optional ADB path for Steam Frame Lepton/Android work:
 
 ```powershell
-$env:ADB_PATH = 'C:\Users\ellio\AppData\Local\Android\Sdk\platform-tools\adb.exe'
+$env:ADB_PATH = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
 ```
 
 Optional SSH password fallback if the device has not accepted the devkit SSH key:
@@ -57,7 +59,7 @@ $env:STEAMOS_DEVKIT_SSH_PASSWORD = 'your-device-password'
 Optional Android build-tools path for APK metadata inspection:
 
 ```powershell
-$env:AAPT_PATH = 'C:\Users\ellio\AppData\Local\Android\Sdk\build-tools\36.1.0\aapt.exe'
+$env:AAPT_PATH = "$env:LOCALAPPDATA\Android\Sdk\build-tools\<version>\aapt.exe"
 ```
 
 ## Steam Frame ADB
@@ -97,11 +99,22 @@ These read-only tools inspect the native SteamOS side of Steam Frame:
 ```text
 lepton_containers(target="frame")
 lepton_logcat(target="frame", context="steamlaunch-3570175983", lines=300)
+lepton_context_inspect(target="frame", context="dev", include_mounts=true)
+lepton_debug_targets(target="frame", context="dev")
+lepton_mounts(target="frame", context="dev", category="obb")
+lepton_apk_info(target="frame", apk_path="~/devkit-game/mygame/game.apk")
+lepton_rootfs_overlay_manifest(target="frame")
+lepton_debug_plan(target="frame", context="dev", mode="gdb")
 steam_logs_manifest(target="frame", pattern="xrclient", limit=20)
 steam_frame_perfcriteria(target="frame")
 steam_frame_cef_pages(target="frame")
 steam_frame_web_ports(target="frame")
 steam_frame_dbus_manager(target="frame")
+steam_frame_manager_properties(target="frame", bus="both")
+steam_frame_manager_interfaces(target="frame", include_system=true)
+deckard_power_status(target="frame")
+pidbridge_status(target="frame")
+deckard_runtime_environment(target="frame")
 native_adbd_status(target="frame")
 coredump_list(target="frame", limit=20)
 steam_services(target="frame", scope="user", pattern="steamvr")
@@ -113,6 +126,12 @@ steam_frame_dev_inventory(target="frame")
 metadata, Lepton CLI help, Lepton script functions/env references, relevant system/user services,
 DBus names, and static strings from known Steam Frame helper binaries. It does not kill, restart,
 trace, or mutate Steam/Lepton state.
+
+The Lepton and Steam Frame manager tools above came from inspecting the live Steam Frame runtime,
+Lepton scripts, DBus introspection, and static binary strings. They are intentionally read-only:
+they expose container labels, debug-port targets, rootfs overlay files, Deckard runtime files,
+power state, pidbridge service/socket state, and DBus method/property inventories without starting
+debug sessions or changing SteamOS Manager state.
 
 DBus control methods, Lepton debug-server lifecycle, RenderDoc/Vulkan layer injection, tracking
 dataset packaging, Mesa debug package installation, and coredump debugger backtraces should be

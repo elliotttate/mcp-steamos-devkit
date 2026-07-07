@@ -224,7 +224,7 @@ def test_adb_lepton_app_diagnostics_builds_fixed_commands(tmp_path: Path, monkey
 
 def test_lepton_containers_adds_adb_targets(tmp_path: Path, monkeypatch) -> None:
     adapter = make_adapter(tmp_path)
-    device = DeviceInfo(id="frame", name="frame", address="192.168.50.128", login="steamos")
+    device = DeviceInfo(id="frame", name="frame", address="192.0.2.10", login="steamos")
 
     monkeypatch.setattr(adapter, "resolve_device", lambda ref: device)
     monkeypatch.setattr(
@@ -244,8 +244,8 @@ def test_lepton_containers_adds_adb_targets(tmp_path: Path, monkeypatch) -> None
 
     result = adapter.lepton_containers(DeviceRef("frame"))
 
-    assert result["device"]["address"] == "192.168.50.128"
-    assert result["containers"][0]["adb_target"] == "192.168.50.128:5556"
+    assert result["device"]["address"] == "192.0.2.10"
+    assert result["containers"][0]["adb_target"] == "192.0.2.10:5556"
 
 
 def test_lepton_logcat_bounds_and_validates_context(tmp_path: Path, monkeypatch) -> None:
@@ -371,3 +371,87 @@ def test_steam_frame_dev_inventory_is_read_only_bounded_script(tmp_path: Path, m
     assert "binary_summary" in scripts[0]
     assert "systemctl" in scripts[0]
     assert "busctl" in scripts[0]
+
+
+def test_lepton_context_inspect_adds_debug_targets_and_validates_context(
+    tmp_path: Path, monkeypatch
+) -> None:
+    adapter = make_adapter(tmp_path)
+    device = DeviceInfo(id="frame", name="frame", address="192.0.2.10", login="steamos")
+    scripts: list[str] = []
+
+    monkeypatch.setattr(adapter, "resolve_device", lambda ref: device)
+
+    def fake_remote_python_json(resolved: DeviceInfo, script: str) -> dict[str, Any]:
+        del resolved
+        scripts.append(script)
+        return {
+            "context": "dev",
+            "exists": True,
+            "ports": {"adb": "5555", "gdb": "1337", "lldb": "2337"},
+            "mounts": [],
+        }
+
+    monkeypatch.setattr(adapter, "_remote_python_json", fake_remote_python_json)
+
+    result = adapter.lepton_context_inspect(DeviceRef("frame"), "dev", include_mounts=True)
+
+    assert result["adb_target"] == "192.0.2.10:5555"
+    assert result["gdb_target"] == "192.0.2.10:1337"
+    assert result["lldb_target"] == "192.0.2.10:2337"
+    assert 'CONTEXT = "dev"' in scripts[0]
+    assert "INCLUDE_MOUNTS = True" in scripts[0]
+
+    with pytest.raises(DevkitAdapterError):
+        adapter.lepton_context_inspect(DeviceRef("frame"), "bad;context")
+
+
+def test_lepton_mounts_and_debug_plan_validate_supported_values(
+    tmp_path: Path, monkeypatch
+) -> None:
+    adapter = make_adapter(tmp_path)
+    device = DeviceInfo(id="frame", name="frame", address="frame", login="steamos")
+    scripts: list[str] = []
+
+    monkeypatch.setattr(adapter, "resolve_device", lambda ref: device)
+
+    def fake_remote_python_json(resolved: DeviceInfo, script: str) -> dict[str, Any]:
+        del resolved
+        scripts.append(script)
+        return {"context": "dev", "exists": True, "category": "obb", "mounts": []}
+
+    monkeypatch.setattr(adapter, "_remote_python_json", fake_remote_python_json)
+
+    mounts = adapter.lepton_mounts(DeviceRef("frame"), "dev", "obb")
+    plan = adapter.lepton_debug_plan(DeviceRef("frame"), "dev", "gdb")
+
+    assert mounts["category"] == "obb"
+    assert 'CATEGORY = "obb"' in scripts[0]
+    assert plan["plan"]["commands"][0] == "lepton gdb_server dev"
+
+    with pytest.raises(DevkitAdapterError):
+        adapter.lepton_mounts(DeviceRef("frame"), "dev", "unsupported")
+    with pytest.raises(DevkitAdapterError):
+        adapter.lepton_debug_plan(DeviceRef("frame"), "dev", "unsupported")
+
+
+def test_steam_frame_manager_interfaces_uses_plural_property_bucket(
+    tmp_path: Path, monkeypatch
+) -> None:
+    adapter = make_adapter(tmp_path)
+    device = DeviceInfo(id="frame", name="frame", address="frame", login="steamos")
+    scripts: list[str] = []
+
+    monkeypatch.setattr(adapter, "resolve_device", lambda ref: device)
+
+    def fake_remote_python_json(resolved: DeviceInfo, script: str) -> dict[str, Any]:
+        del resolved
+        scripts.append(script)
+        return {"service": "com.steampowered.SteamOSManager1", "paths": {}}
+
+    monkeypatch.setattr(adapter, "_remote_python_json", fake_remote_python_json)
+
+    adapter.steam_frame_manager_interfaces(DeviceRef("frame"), include_system=True)
+
+    assert '"property": "properties"' in scripts[0]
+    assert 'KIND_BUCKETS[kind]' in scripts[0]

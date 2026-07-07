@@ -70,11 +70,22 @@ def create_server() -> FastMCP:
                 "lepton_cli_help",
                 "lepton_containers",
                 "lepton_logcat",
+                "lepton_context_inspect",
+                "lepton_debug_targets",
+                "lepton_mounts",
+                "lepton_apk_info",
+                "lepton_rootfs_overlay_manifest",
+                "lepton_debug_plan",
                 "steam_logs_manifest",
                 "steam_frame_perfcriteria",
                 "steam_frame_cef_pages",
                 "steam_frame_web_ports",
                 "steam_frame_dbus_manager",
+                "steam_frame_manager_properties",
+                "steam_frame_manager_interfaces",
+                "deckard_power_status",
+                "pidbridge_status",
+                "deckard_runtime_environment",
                 "native_adbd_status",
                 "coredump_list",
                 "steam_services",
@@ -149,11 +160,22 @@ def create_server() -> FastMCP:
                 "lepton_cli_help",
                 "lepton_containers",
                 "lepton_logcat",
+                "lepton_context_inspect",
+                "lepton_debug_targets",
+                "lepton_mounts",
+                "lepton_apk_info",
+                "lepton_rootfs_overlay_manifest",
+                "lepton_debug_plan",
                 "steam_logs_manifest",
                 "steam_frame_perfcriteria",
                 "steam_frame_cef_pages",
                 "steam_frame_web_ports",
                 "steam_frame_dbus_manager",
+                "steam_frame_manager_properties",
+                "steam_frame_manager_interfaces",
+                "deckard_power_status",
+                "pidbridge_status",
+                "deckard_runtime_environment",
                 "native_adbd_status",
                 "coredump_list",
                 "steam_services",
@@ -184,6 +206,7 @@ def create_server() -> FastMCP:
                 "Lepton gdb/lldb server lifecycle",
                 "RenderDoc/Vulkan validation/FDM/strace launch toggles",
                 "SteamOS Manager DBus controls discovered from introspection/decompile",
+                "Deckard runtime/state writes such as charger power_event",
             ],
         }
 
@@ -707,6 +730,112 @@ def create_server() -> FastMCP:
         )
 
     @mcp.tool()
+    def lepton_context_inspect(
+        target: str,
+        context: str,
+        include_mounts: bool = False,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Inspect one Lepton container context, including labels and optional mounts."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "lepton_context_inspect",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.lepton_context_inspect(ref, context, include_mounts),
+        )
+
+    @mcp.tool()
+    def lepton_debug_targets(
+        target: str,
+        context: str,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Report existing ADB/GDB/LLDB targets and listener state for a Lepton context."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "lepton_debug_targets",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.lepton_debug_targets(ref, context),
+        )
+
+    @mcp.tool()
+    def lepton_mounts(
+        target: str,
+        context: str,
+        category: str = "all",
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Read Lepton podman mounts for a context, optionally filtered by a known category."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "lepton_mounts",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.lepton_mounts(ref, context, category),
+        )
+
+    @mcp.tool()
+    def lepton_apk_info(
+        target: str,
+        apk_path: str,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Run Lepton's own apk-info-extractor on a remote APK path."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "lepton_apk_info",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.lepton_apk_info(ref, apk_path),
+        )
+
+    @mcp.tool()
+    def lepton_rootfs_overlay_manifest(
+        target: str,
+        max_depth: int = 4,
+        include_snippets: bool = True,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Inventory Lepton rootfs overlay files, hashes, and selected small snippets."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "lepton_rootfs_overlay_manifest",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.lepton_rootfs_overlay_manifest(ref, max_depth, include_snippets),
+        )
+
+    @mcp.tool()
+    def lepton_debug_plan(
+        target: str,
+        context: str,
+        mode: str,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Return a non-executing Lepton debug/capture launch plan for gdb/lldb/strace/perfetto/renderdoc/vulkan layers."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "lepton_debug_plan",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.lepton_debug_plan(ref, context, mode),
+        )
+
+    @mcp.tool()
     def steam_logs_manifest(
         target: str,
         pattern: str | None = None,
@@ -788,6 +917,88 @@ def create_server() -> FastMCP:
             "steam_frame_dbus_manager",
             SafetyLevel.READ_ONLY,
             lambda: adapter.steam_frame_dbus_manager(ref),
+        )
+
+    @mcp.tool()
+    def steam_frame_manager_properties(
+        target: str,
+        bus: str = "both",
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Read SteamOS Manager properties from the user bus, system bus, or both."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "steam_frame_manager_properties",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.steam_frame_manager_properties(ref, bus),
+        )
+
+    @mcp.tool()
+    def steam_frame_manager_interfaces(
+        target: str,
+        include_system: bool = True,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Read SteamOS Manager interface/method/property/signal inventory, including Jobs when present."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "steam_frame_manager_interfaces",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.steam_frame_manager_interfaces(ref, include_system),
+        )
+
+    @mcp.tool()
+    def deckard_power_status(
+        target: str,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Read Deckard/Steam Frame charger runtime files and power-supply sysfs state."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "deckard_power_status",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.deckard_power_status(ref),
+        )
+
+    @mcp.tool()
+    def pidbridge_status(
+        target: str,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Read pidbridge unit and socket state without speaking the private socket protocol."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "pidbridge_status",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.pidbridge_status(ref),
+        )
+
+    @mcp.tool()
+    def deckard_runtime_environment(
+        target: str,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Read Deckard runtime version and Steam/Mesa launch environment defaults."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "deckard_runtime_environment",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.deckard_runtime_environment(ref),
         )
 
     @mcp.tool()

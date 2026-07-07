@@ -1172,6 +1172,544 @@ print(json.dumps({"entries": entries, "returncode": proc.returncode, "stderr": p
             ],
         }
 
+    def lepton_context_inspect(
+        self,
+        ref: DeviceRef,
+        context: str,
+        include_mounts: bool = False,
+    ) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        clean_context = self._validate_lepton_context(context)
+        data = self._remote_python_json(
+            device,
+            "CONTEXT = "
+            + json.dumps(clean_context)
+            + "\nINCLUDE_MOUNTS = "
+            + ("True" if include_mounts else "False")
+            + r"""
+
+import json
+import subprocess
+
+name = f"lepton-{CONTEXT}"
+proc = subprocess.run(["podman", "inspect", name], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+if proc.returncode != 0:
+    print(json.dumps({"context": CONTEXT, "name": name, "exists": False, "stderr": proc.stderr.strip(), "returncode": proc.returncode}))
+    raise SystemExit(0)
+payload = json.loads(proc.stdout)
+item = payload[0] if isinstance(payload, list) and payload else payload
+labels = ((item.get("Config") or {}).get("Labels") or {})
+state = item.get("State") or {}
+network = ((item.get("NetworkSettings") or {}).get("Networks") or {})
+mounts = []
+if INCLUDE_MOUNTS:
+    for mount in item.get("Mounts") or []:
+        mounts.append(
+            {
+                "type": mount.get("Type"),
+                "source": mount.get("Source"),
+                "destination": mount.get("Destination"),
+                "mode": mount.get("Mode"),
+                "rw": mount.get("RW"),
+            }
+        )
+print(
+    json.dumps(
+        {
+            "context": CONTEXT,
+            "name": (item.get("Name") or name).lstrip("/"),
+            "exists": True,
+            "id": item.get("Id"),
+            "status": state.get("Status"),
+            "running": bool(state.get("Running")),
+            "pid": state.get("Pid"),
+            "started_at": state.get("StartedAt"),
+            "finished_at": state.get("FinishedAt"),
+            "labels": labels,
+            "ports": {"adb": labels.get("adb_port"), "gdb": labels.get("gdb_port"), "lldb": labels.get("lldb_port")},
+            "prefix": labels.get("PREFIX"),
+            "steam_compat_data_path": labels.get("STEAM_COMPAT_DATA_PATH"),
+            "lepton_pid": labels.get("lepton_pid"),
+            "network": network,
+            "mounts": mounts,
+        }
+    )
+)
+""",
+        )
+        ports = data.get("ports") or {}
+        for key, port in ports.items():
+            if port and device.address:
+                data[f"{key}_target"] = f"{device.address}:{port}"
+        return {"device": to_jsonable(device), **data}
+
+    def lepton_debug_targets(self, ref: DeviceRef, context: str) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        clean_context = self._validate_lepton_context(context)
+        data = self._remote_python_json(
+            device,
+            "CONTEXT = " + json.dumps(clean_context) + r"""
+
+import json
+import re
+import subprocess
+
+name = f"lepton-{CONTEXT}"
+inspect = subprocess.run(["podman", "inspect", name], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+result = {"context": CONTEXT, "exists": inspect.returncode == 0, "inspect_stderr": inspect.stderr.strip()}
+ports = {}
+if inspect.returncode == 0:
+    payload = json.loads(inspect.stdout)
+    item = payload[0] if isinstance(payload, list) and payload else payload
+    labels = ((item.get("Config") or {}).get("Labels") or {})
+    ports = {"adb": labels.get("adb_port"), "gdb": labels.get("gdb_port"), "lldb": labels.get("lldb_port")}
+result["ports"] = ports
+ss = subprocess.run(["ss", "-ltnp"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+listeners = []
+for line in ss.stdout.splitlines():
+    match = re.search(r":(\d+)\s+", line)
+    if not match:
+        continue
+    port = match.group(1)
+    if port in {str(value) for value in ports.values() if value}:
+        listeners.append({"port": port, "line": line})
+result["listeners"] = listeners
+result["ss_returncode"] = ss.returncode
+result["ss_stderr"] = ss.stderr.strip()
+print(json.dumps(result))
+""",
+        )
+        for key, port in (data.get("ports") or {}).items():
+            if port and device.address:
+                data[f"{key}_target"] = f"{device.address}:{port}"
+        data["notes"] = [
+            "This reports existing labels/listeners only.",
+            "Starting or killing gdb/lldb servers should be a separate confirmation-gated action.",
+        ]
+        return {"device": to_jsonable(device), **data}
+
+    def lepton_mounts(self, ref: DeviceRef, context: str, category: str = "all") -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        clean_context = self._validate_lepton_context(context)
+        categories = {"all", "obb", "steamvr", "steamlibs", "openxr", "vulkan", "debugfs", "storage"}
+        clean_category = category.lower()
+        if clean_category not in categories:
+            raise DevkitAdapterError(f"category must be one of: {', '.join(sorted(categories))}")
+        data = self._remote_python_json(
+            device,
+            "CONTEXT = " + json.dumps(clean_context) + "\nCATEGORY = " + json.dumps(clean_category) + r"""
+
+import json
+import subprocess
+
+
+def classify(mount):
+    text = " ".join(str(mount.get(key) or "") for key in ("Source", "Destination", "Name")).lower()
+    if "obb" in text or "android/obb" in text:
+        return "obb"
+    if "steamvr" in text:
+        return "steamvr"
+    if "steamapps" in text or "steamrt" in text or "steam" in text:
+        return "steamlibs"
+    if "openxr" in text:
+        return "openxr"
+    if "vulkan" in text:
+        return "vulkan"
+    if "debug" in text or "trace" in text:
+        return "debugfs"
+    if "/data" in text or "/sdcard" in text or "media/0" in text or "storage" in text:
+        return "storage"
+    return "other"
+
+
+name = f"lepton-{CONTEXT}"
+proc = subprocess.run(["podman", "inspect", name], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+if proc.returncode != 0:
+    print(json.dumps({"context": CONTEXT, "exists": False, "stderr": proc.stderr.strip(), "returncode": proc.returncode, "mounts": []}))
+    raise SystemExit(0)
+payload = json.loads(proc.stdout)
+item = payload[0] if isinstance(payload, list) and payload else payload
+mounts = []
+for mount in item.get("Mounts") or []:
+    kind = classify(mount)
+    if CATEGORY != "all" and kind != CATEGORY:
+        continue
+    mounts.append(
+        {
+            "category": kind,
+            "type": mount.get("Type"),
+            "source": mount.get("Source"),
+            "destination": mount.get("Destination"),
+            "mode": mount.get("Mode"),
+            "rw": mount.get("RW"),
+            "propagation": mount.get("Propagation"),
+        }
+    )
+labels = ((item.get("Config") or {}).get("Labels") or {})
+print(json.dumps({"context": CONTEXT, "exists": True, "category": CATEGORY, "labels": labels, "mounts": mounts}))
+""",
+        )
+        return {"device": to_jsonable(device), **data}
+
+    def lepton_apk_info(self, ref: DeviceRef, apk_path: str) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        if not apk_path.strip():
+            raise DevkitAdapterError("apk_path is required")
+        data = self._remote_python_json(
+            device,
+            "APK_PATH = " + json.dumps(apk_path.strip()) + r"""
+
+import json
+import os
+import subprocess
+from pathlib import Path
+
+home = os.path.expanduser("~")
+apk = APK_PATH.replace("~", home, 1) if APK_PATH == "~" or APK_PATH.startswith("~/") else APK_PATH
+extractor = os.path.join(home, ".local/share/Steam/steamapps/common/Lepton/liblepton/apk_extractor/bin/apk-info-extractor")
+result = {"apk_path": apk, "extractor": extractor, "exists": os.path.isfile(apk), "fields": {}}
+if not result["exists"]:
+    print(json.dumps(result))
+    raise SystemExit(0)
+if not os.path.isfile(extractor):
+    result["error"] = "apk-info-extractor not found"
+    print(json.dumps(result))
+    raise SystemExit(0)
+for key, flag in {
+    "package_name": "--print-app-id",
+    "activity_name": "--print-activity-name",
+    "version_code": "--print-app-version",
+}.items():
+    proc = subprocess.run([extractor, flag, apk], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False, timeout=20)
+    result["fields"][key] = {"returncode": proc.returncode, "stdout": proc.stdout.strip(), "stderr": proc.stderr.strip()}
+result["expected_main_obb"] = None
+package = result["fields"].get("package_name", {}).get("stdout")
+version = result["fields"].get("version_code", {}).get("stdout")
+if package and version:
+    result["expected_main_obb"] = f"main.{version}.{package}.obb"
+print(json.dumps(result))
+""",
+        )
+        return {"device": to_jsonable(device), **data}
+
+    def lepton_rootfs_overlay_manifest(
+        self,
+        ref: DeviceRef,
+        max_depth: int = 4,
+        include_snippets: bool = True,
+    ) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        bounded_depth = min(max(int(max_depth), 1), 8)
+        data = self._remote_python_json(
+            device,
+            "MAX_DEPTH = "
+            + str(bounded_depth)
+            + "\nINCLUDE_SNIPPETS = "
+            + ("True" if include_snippets else "False")
+            + r"""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+
+root = Path(os.path.expanduser("~")) / ".local/share/Steam/steamapps/common/Lepton/images/rootfs_overlay"
+entries = []
+if root.exists():
+    base_depth = len(root.parts)
+    for path in sorted(root.rglob("*")):
+        depth = len(path.parts) - base_depth
+        if depth > MAX_DEPTH or not path.is_file():
+            continue
+        try:
+            data = path.read_bytes()
+            stat = path.stat()
+        except OSError:
+            continue
+        item = {
+            "path": str(path),
+            "relative_path": str(path.relative_to(root)),
+            "size": stat.st_size,
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+        if INCLUDE_SNIPPETS and stat.st_size <= 16384:
+            try:
+                item["snippet"] = data.decode("utf-8", "replace")[:4000]
+            except Exception:
+                pass
+        entries.append(item)
+print(json.dumps({"root": str(root), "exists": root.exists(), "entries": entries}))
+""",
+        )
+        return {"device": to_jsonable(device), **data}
+
+    def lepton_debug_plan(self, ref: DeviceRef, context: str, mode: str) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        clean_context = self._validate_lepton_context(context)
+        clean_mode = mode.lower().strip()
+        plans: dict[str, dict[str, Any]] = {
+            "gdb": {
+                "safety_for_execution": "write",
+                "status_tool": "lepton_debug_targets",
+                "commands": [
+                    f"lepton gdb_server {clean_context}",
+                    f"lepton gdb_attach {clean_context}",
+                    f"lepton kill_gdb_server {clean_context}",
+                ],
+                "env": ["LEPTON_DEBUG_LAUNCH"],
+            },
+            "lldb": {
+                "safety_for_execution": "write",
+                "status_tool": "lepton_debug_targets",
+                "commands": [f"lepton lldb_server {clean_context}", f"lepton kill_lldb_server {clean_context}"],
+                "env": ["LEPTON_DEBUG_LAUNCH"],
+            },
+            "strace": {
+                "safety_for_execution": "write",
+                "commands": ["launch with LEPTON_STRACE=1", "extract /data/strace-<app-id>.log after exit"],
+                "env": ["LEPTON_STRACE", "LEPTON_STRACE_ARGS"],
+            },
+            "perfetto": {
+                "safety_for_execution": "write",
+                "commands": [f"lepton perfetto {clean_context}", "download /tmp/lepton-<context>-*.pftrace"],
+                "env": ["PERFETTO_CONFIG"],
+            },
+            "renderdoc": {
+                "safety_for_execution": "write",
+                "commands": ["launch title with ENABLE_VULKAN_RENDERDOC_CAPTURE=1"],
+                "env": ["ENABLE_VULKAN_RENDERDOC_CAPTURE", "VK_INSTANCE_LAYERS"],
+            },
+            "vulkan_layers": {
+                "safety_for_execution": "write",
+                "commands": ["launch title with selected Vulkan layer env vars"],
+                "env": [
+                    "ENABLE_VULKAN_VALIDATION_LAYER",
+                    "ENABLE_VULKAN_FDM_INJECTION_LAYER",
+                    "ENABLE_VULKAN_RPO_LAYER",
+                    "VK_INSTANCE_LAYERS",
+                ],
+            },
+        }
+        if clean_mode not in plans:
+            raise DevkitAdapterError(f"mode must be one of: {', '.join(sorted(plans))}")
+        return {
+            "device": to_jsonable(device),
+            "context": clean_context,
+            "mode": clean_mode,
+            "plan": plans[clean_mode],
+            "notes": [
+                "This is a read-only execution plan extracted from Lepton scripts.",
+                "Run/capture/debug lifecycle actions should be separate confirmation-gated tools.",
+            ],
+        }
+
+    def steam_frame_manager_properties(self, ref: DeviceRef, bus: str = "both") -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        clean_bus = bus.lower()
+        if clean_bus not in {"user", "system", "both"}:
+            raise DevkitAdapterError("bus must be 'user', 'system', or 'both'")
+        data = self._remote_python_json(
+            device,
+            "BUS = " + json.dumps(clean_bus) + r"""
+
+import json
+import os
+import subprocess
+
+SERVICE = "com.steampowered.SteamOSManager1"
+PATH = "/com/steampowered/SteamOSManager1"
+
+
+def collect(bus):
+    args = ["busctl"]
+    if bus == "user":
+        args.append("--user")
+    args += ["introspect", "--no-pager", SERVICE, PATH]
+    env = os.environ.copy()
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False, env=env)
+    interfaces = {}
+    current = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("NAME ") or not line.strip():
+            continue
+        parts = line.split(None, 4)
+        if len(parts) < 2:
+            continue
+        name, kind = parts[0], parts[1]
+        if kind == "interface":
+            current = name
+            interfaces.setdefault(current, {})
+            continue
+        if current and kind == "property":
+            flags = parts[4] if len(parts) > 4 else ""
+            interfaces[current][name.lstrip(".")] = {
+                "signature": parts[2] if len(parts) > 2 else "",
+                "value": parts[3] if len(parts) > 3 else "",
+                "raw": line,
+                "flags": flags,
+                "writable": "writable" in flags,
+                "const": "const" in flags,
+            }
+    return {"returncode": proc.returncode, "stderr": proc.stderr.strip(), "interfaces": interfaces}
+
+
+buses = ["user", "system"] if BUS == "both" else [BUS]
+print(json.dumps({"service": SERVICE, "path": PATH, "buses": {bus: collect(bus) for bus in buses}}))
+""",
+        )
+        return {"device": to_jsonable(device), **data}
+
+    def steam_frame_manager_interfaces(self, ref: DeviceRef, include_system: bool = True) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        data = self._remote_python_json(
+            device,
+            "INCLUDE_SYSTEM = " + ("True" if include_system else "False") + r"""
+
+import json
+import os
+import subprocess
+
+SERVICE = "com.steampowered.SteamOSManager1"
+PATHS = ["/com/steampowered/SteamOSManager1", "/com/steampowered/SteamOSManager1/Jobs"]
+KIND_BUCKETS = {"property": "properties", "method": "methods", "signal": "signals"}
+
+
+def introspect(bus, path):
+    args = ["busctl"]
+    if bus == "user":
+        args.append("--user")
+    args += ["introspect", "--no-pager", SERVICE, path]
+    env = os.environ.copy()
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False, env=env)
+    interfaces = []
+    current = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("NAME ") or not line.strip():
+            continue
+        parts = line.split(None, 4)
+        if len(parts) < 2:
+            continue
+        name, kind = parts[0], parts[1]
+        if kind == "interface":
+            current = {"name": name, "properties": [], "methods": [], "signals": []}
+            interfaces.append(current)
+        elif current and kind in {"property", "method", "signal"}:
+            current[KIND_BUCKETS[kind]].append({"name": name.lstrip("."), "raw": line})
+    return {"returncode": proc.returncode, "stderr": proc.stderr.strip(), "interfaces": interfaces}
+
+
+buses = ["user", "system"] if INCLUDE_SYSTEM else ["user"]
+print(json.dumps({"service": SERVICE, "paths": {bus: {path: introspect(bus, path) for path in PATHS} for bus in buses}}))
+""",
+        )
+        return {"device": to_jsonable(device), **data}
+
+    def deckard_power_status(self, ref: DeviceRef) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        data = self._remote_python_json(
+            device,
+            r"""
+import json
+from pathlib import Path
+
+paths = [
+    "/run/deckardcharger/battery_status",
+    "/run/deckardcharger/battery_percent",
+    "/run/deckardcharger/ac_status",
+    "/run/deckardcharger/secs_until_battery_full",
+    "/run/deckardcharger/secs_until_shutdown_request",
+]
+values = {}
+for item in paths:
+    path = Path(item)
+    try:
+        values[item] = {"exists": path.exists(), "value": path.read_text(encoding="utf-8", errors="replace").strip()}
+    except OSError as exc:
+        values[item] = {"exists": path.exists(), "error": str(exc)}
+sysfs = {}
+for path in Path("/sys/class/power_supply").glob("*"):
+    if not path.is_dir():
+        continue
+    props = {}
+    for name in ("type", "status", "capacity", "online", "voltage_now", "current_now", "charge_now", "energy_now"):
+        prop = path / name
+        if prop.exists():
+            try:
+                props[name] = prop.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                pass
+    if props:
+        sysfs[str(path)] = props
+print(json.dumps({"runtime_files": values, "sysfs_power_supply": sysfs}))
+""",
+        )
+        return {"device": to_jsonable(device), **data}
+
+    def pidbridge_status(self, ref: DeviceRef) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        data = self._remote_python_json(
+            device,
+            r"""
+import json
+import os
+import stat
+import subprocess
+from pathlib import Path
+
+socket_path = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "pidbridge/pidbridge.sock"
+unit = subprocess.run(
+    ["systemctl", "--user", "show", "pidbridge.service", "--no-pager", "-pActiveState", "-pSubState", "-pMainPID", "-pFragmentPath", "-pExecStart"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+    check=False,
+)
+unit_status = {}
+for line in unit.stdout.splitlines():
+    if "=" in line:
+        key, value = line.split("=", 1)
+        unit_status[key] = value
+sock = {"path": str(socket_path), "exists": socket_path.exists()}
+if socket_path.exists():
+    st = socket_path.stat()
+    sock.update({"mode": oct(stat.S_IMODE(st.st_mode)), "uid": st.st_uid, "gid": st.st_gid, "is_socket": stat.S_ISSOCK(st.st_mode)})
+print(json.dumps({"unit": unit_status, "unit_stderr": unit.stderr.strip(), "socket": sock}))
+""",
+        )
+        return {
+            "device": to_jsonable(device),
+            **data,
+            "notes": ["Socket protocol is not exposed; this reports service and socket state only."],
+        }
+
+    def deckard_runtime_environment(self, ref: DeviceRef) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        data = self._remote_python_json(
+            device,
+            r"""
+import json
+from pathlib import Path
+
+files = [
+    "/usr/share/deckard/version",
+    "/usr/share/deckard/mesavars.sh",
+    "/usr/share/deckard/steam_launch_wrapper_env_defaults.txt",
+]
+entries = {}
+for item in files:
+    path = Path(item)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        entries[item] = {"exists": True, "text": text[:12000], "truncated": len(text) > 12000}
+    except OSError as exc:
+        entries[item] = {"exists": path.exists(), "error": str(exc)}
+print(json.dumps({"files": entries}))
+""",
+        )
+        return {"device": to_jsonable(device), **data}
+
     def steam_services(
         self,
         ref: DeviceRef,
@@ -1877,6 +2415,13 @@ print(
     @staticmethod
     def _adb_serial_args(serial: str | None) -> list[str]:
         return ["-s", serial] if serial else []
+
+    @staticmethod
+    def _validate_lepton_context(context: str) -> str:
+        clean_context = context.strip()
+        if not LEPTON_CONTEXT_RE.fullmatch(clean_context):
+            raise DevkitAdapterError(f"Invalid Lepton context name: {context}")
+        return clean_context
 
     @staticmethod
     def _select_top_level_apk(root: Path, apk_name: str | None = None) -> Path:
