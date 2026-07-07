@@ -17,6 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -2245,6 +2246,637 @@ print(json.dumps({"root": str(root), "exists": root.is_dir(), "limit": LIMIT, "d
             "local_folder": str(Path(output_folder).expanduser()),
             "transfer": transfer,
         }
+
+    def local_steamvr_automation_inventory(self, steamvr_root: str | None = None) -> dict[str, Any]:
+        root = self._resolve_steamvr_root(steamvr_root)
+        if root is None:
+            return {
+                "ok": False,
+                "steamvr_root": None,
+                "notes": ["SteamVR was not found. Set steamvr_root or STEAMVR_ROOT."],
+            }
+
+        drivers_dir = root / "drivers"
+        drivers = sorted(path.name for path in drivers_dir.iterdir() if path.is_dir()) if drivers_dir.is_dir() else []
+
+        def read_json(path: Path) -> dict[str, Any] | None:
+            try:
+                return json.loads(path.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                return None
+
+        null_driver = root / "drivers/null"
+        null_settings = null_driver / "resources/settings/default.vrsettings"
+        frame_input_dir = root / "drivers/frame_controller/resources/input"
+        frame_profile = frame_input_dir / "frame_controller_profile.json"
+        frame_profile_json = read_json(frame_profile)
+        frame_bindings = sorted(path.name for path in frame_input_dir.glob("*.json")) if frame_input_dir.is_dir() else []
+        pose_paths: list[str] = []
+        input_paths: list[str] = []
+        if isinstance(frame_profile_json, dict):
+            sources = frame_profile_json.get("input_source") or {}
+            if isinstance(sources, dict):
+                for key, value in sources.items():
+                    if isinstance(value, dict) and value.get("type") == "pose":
+                        pose_paths.append(key)
+                    else:
+                        input_paths.append(key)
+
+        bin_dir = root / ("bin/win64" if platform.system() == "Windows" else "bin/linux64")
+        binaries = {
+            name: str(bin_dir / name)
+            for name in (
+                "vrmonitor.exe",
+                "vrserver.exe",
+                "vrcompositor.exe",
+                "vrpathreg.exe",
+                "vrstartup.exe",
+            )
+            if (bin_dir / name).exists()
+        }
+        if platform.system() != "Windows":
+            binaries = {
+                name: str(bin_dir / name)
+                for name in ("vrmonitor", "vrserver", "vrcompositor", "vrpathreg", "vrstartup")
+                if (bin_dir / name).exists()
+            }
+
+        return {
+            "ok": True,
+            "steamvr_root": str(root),
+            "drivers": drivers,
+            "null_driver": {
+                "exists": null_driver.is_dir(),
+                "manifest": str(null_driver / "driver.vrdrivermanifest"),
+                "default_settings": read_json(null_settings),
+            },
+            "frame_controller": {
+                "exists": frame_input_dir.is_dir(),
+                "profile": str(frame_profile),
+                "controller_type": frame_profile_json.get("controller_type")
+                if isinstance(frame_profile_json, dict)
+                else None,
+                "pose_paths": pose_paths,
+                "input_paths": input_paths,
+                "binding_files": frame_bindings,
+            },
+            "binaries": binaries,
+            "capabilities": [
+                {
+                    "name": "pc_synthetic_hmd",
+                    "available": null_driver.is_dir(),
+                    "route": "SteamVR null driver",
+                    "notes": "Good for compositor/app automation on PC; does not synthesize Frame controller poses by itself.",
+                },
+                {
+                    "name": "frame_controller_binding_analysis",
+                    "available": frame_input_dir.is_dir(),
+                    "route": "Frame controller input profile and binding JSON files",
+                    "notes": "Useful for validating actions and bindings before building input replay.",
+                },
+                {
+                    "name": "controller_pose_replay",
+                    "available": False,
+                    "route": "No built-in host-side Frame controller pose replay CLI was found.",
+                    "notes": "Likely requires a custom OpenVR server driver, OpenXR API layer, or a Frame-side xrservice replay tool if one is later discovered.",
+                },
+            ],
+        }
+
+    def steam_frame_automation_inventory(self, ref: DeviceRef) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        data = self._remote_python_json(
+            device,
+            r"""
+import json
+import os
+import subprocess
+from pathlib import Path
+
+
+def run(args, timeout=10):
+    proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False, timeout=timeout)
+    return {"returncode": proc.returncode, "stdout": proc.stdout.strip(), "stderr": proc.stderr.strip()}
+
+
+def which(name):
+    proc = subprocess.run(["sh", "-lc", f"command -v {name}"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    return proc.stdout.strip() or None
+
+
+steamvr_path = run(["steamvr", "path"]).get("stdout") or ""
+steamvr_logpath = run(["steamvr", "logpath"]).get("stdout") or ""
+steamvr_configpath = run(["steamvr", "configpath"]).get("stdout") or ""
+steamvr_bin = Path(steamvr_path) / "bin/linuxarm64" if steamvr_path else None
+steamvr_binaries = {}
+if steamvr_bin:
+    for name in ["vrcmd", "vrstartup", "vrserver", "vrcompositor", "vrmonitor", "vrpathreg"]:
+        path = steamvr_bin / name
+        steamvr_binaries[name] = {"path": str(path), "exists": path.exists()}
+
+dataset_root = Path.home() / ".config/openvr/config/cv/xrservice/datasets"
+datasets = []
+if dataset_root.is_dir():
+    for path in sorted(dataset_root.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
+        if path.is_dir():
+            datasets.append({"name": path.name, "path": str(path), "mtime": path.stat().st_mtime})
+
+controller_config_roots = [
+    Path.home() / ".local/share/Steam/userdata",
+    Path.home() / ".steam/steam/userdata",
+]
+controller_configs = []
+for root in controller_config_roots:
+    if not root.is_dir():
+        continue
+    for path in root.glob("*/config/controller_configs"):
+        controller_configs.append({"path": str(path), "exists": path.is_dir()})
+
+tool_names = [
+    "python3",
+    "busctl",
+    "systemctl",
+    "adb",
+    "inputplumberctl",
+    "evemu-record",
+    "evemu-play",
+    "ydotool",
+    "wtype",
+    "xdotool",
+    "curl",
+]
+tools = {name: which(name) for name in tool_names}
+
+ss = run(["ss", "-ltnp"], timeout=10)
+web_ports = []
+for line in ss.get("stdout", "").splitlines():
+    if any(port in line for port in [":8080 ", ":8081 ", ":27062 ", ":27063 "]):
+        web_ports.append(line)
+
+lepton = run(["sh", "-lc", "lepton 2>&1 | head -80"], timeout=15)
+lepton_help = lepton.get("stdout") or lepton.get("stderr") or ""
+
+print(
+    json.dumps(
+        {
+            "steamvr": {
+                "path": steamvr_path,
+                "logpath": steamvr_logpath,
+                "configpath": steamvr_configpath,
+                "binaries": steamvr_binaries,
+            },
+            "tracking_datasets": {"root": str(dataset_root), "exists": dataset_root.is_dir(), "latest": datasets},
+            "controller_configs": controller_configs,
+            "tools": tools,
+            "web_debug_ports": web_ports,
+            "lepton_help": lepton_help,
+            "capabilities": {
+                "tracking_dataset_capture": dataset_root.parent.exists(),
+                "tracking_dataset_replay_cli_found": any("replay" in value.lower() for value in [lepton_help]),
+                "ui_automation_via_cef": bool(web_ports),
+                "android_input_via_adb": bool(tools.get("adb")),
+                "linux_input_tools": {name: tools.get(name) for name in ["evemu-record", "evemu-play", "ydotool", "wtype", "xdotool"]},
+            },
+        }
+    )
+)
+""",
+            timeout_seconds=45,
+        )
+        notes = [
+            "Tracking datasets can be recorded from SteamVR Developer settings and downloaded with sync_tracking_dataset.",
+            "No public Frame-side controller pose injection command is assumed unless inventory finds one.",
+            "CEF web ports can support UI automation of Steam/SteamVR pages with a browser automation client.",
+        ]
+        return {"device": to_jsonable(device), **data, "notes": notes}
+
+    def steamvr_vrcmd_capability_inventory(self, steamvr_root: str | None = None) -> dict[str, Any]:
+        root = self._resolve_steamvr_root(steamvr_root)
+        if root is None:
+            return {
+                "ok": False,
+                "steamvr_root": None,
+                "notes": ["SteamVR was not found. Set steamvr_root or STEAMVR_ROOT."],
+            }
+
+        bin_dir = root / ("bin/win64" if platform.system() == "Windows" else "bin/linux64")
+        suffix = ".exe" if platform.system() == "Windows" else ""
+        binaries = {
+            "vrcmd": bin_dir / f"vrcmd{suffix}",
+            "vrserver": bin_dir / f"vrserver{suffix}",
+            "vrpathreg": bin_dir / f"vrpathreg{suffix}",
+        }
+        probes = {
+            "capture_replay": ["--replay", "--rewind", "--startcapture", "--stopcapture"],
+            "pose_polling": ["--pollposes", "--pollcontrollers"],
+            "event_injection": ["--send-vrevent"],
+            "driver_simulation": [
+                "simulate_hmd",
+                "simulate_controller_type",
+                "forcedDriver",
+                "activateMultipleDrivers",
+                "driver_null",
+            ],
+        }
+        findings: dict[str, Any] = {}
+        for name, path in binaries.items():
+            entry: dict[str, Any] = {"path": str(path), "exists": path.exists(), "tokens": {}}
+            if path.exists():
+                try:
+                    haystack = path.read_bytes().lower()
+                    for category, tokens in probes.items():
+                        entry["tokens"][category] = [
+                            token for token in tokens if token.lower().encode("utf-8") in haystack
+                        ]
+                except OSError as exc:
+                    entry["error"] = str(exc)
+            findings[name] = entry
+
+        categories = {
+            category: sorted(
+                {
+                    token
+                    for entry in findings.values()
+                    for token in entry.get("tokens", {}).get(category, [])
+                }
+            )
+            for category in probes
+        }
+        return {
+            "ok": True,
+            "steamvr_root": str(root),
+            "bin_dir": str(bin_dir),
+            "binaries": findings,
+            "categories": categories,
+            "capabilities": [
+                {
+                    "name": "host_capture_replay_tokens",
+                    "available": bool(categories["capture_replay"]),
+                    "tokens": categories["capture_replay"],
+                    "notes": "String evidence only; this is not validated as Steam Frame tracking dataset replay.",
+                },
+                {
+                    "name": "host_pose_polling_tokens",
+                    "available": bool(categories["pose_polling"]),
+                    "tokens": categories["pose_polling"],
+                    "notes": "Useful for observation tooling; not a controller pose injection route by itself.",
+                },
+                {
+                    "name": "driver_simulation_tokens",
+                    "available": bool(categories["driver_simulation"]),
+                    "tokens": categories["driver_simulation"],
+                    "notes": "Promising for PC-side synthetic-driver testing when paired with SteamVR null/custom drivers.",
+                },
+            ],
+        }
+
+    def tracking_dataset_analyze(self, dataset_path: str) -> dict[str, Any]:
+        root = Path(dataset_path).expanduser()
+        if not root.exists():
+            raise DevkitAdapterError(f"Tracking dataset path does not exist: {dataset_path}")
+
+        signal_terms = {
+            "hmd": ["hmd", "head"],
+            "controller": ["controller", "left", "right", "hand"],
+            "pose": ["pose", "track", "tracking"],
+            "imu": ["imu", "accel", "gyro"],
+            "camera": ["camera", "cam", "image"],
+            "screen": ["screen", "display"],
+            "audio": ["audio", "mic", "wav"],
+            "logs": ["log", "txt", "json"],
+        }
+
+        def classify(name: str) -> list[str]:
+            lower = name.lower()
+            return [
+                category
+                for category, terms in signal_terms.items()
+                if any(term in lower for term in terms)
+            ]
+
+        files: list[dict[str, Any]] = []
+        if root.is_dir():
+            for path in root.rglob("*"):
+                if not path.is_file():
+                    continue
+                rel = path.relative_to(root).as_posix()
+                size = path.stat().st_size
+                files.append(
+                    {
+                        "path": rel,
+                        "size": size,
+                        "suffix": path.suffix.lower(),
+                        "signals": classify(rel),
+                    }
+                )
+            source_kind = "directory"
+        elif zipfile.is_zipfile(root):
+            with zipfile.ZipFile(root) as archive:
+                for info in archive.infolist():
+                    if info.is_dir():
+                        continue
+                    files.append(
+                        {
+                            "path": info.filename,
+                            "size": info.file_size,
+                            "suffix": Path(info.filename).suffix.lower(),
+                            "signals": classify(info.filename),
+                        }
+                    )
+            source_kind = "zip"
+        else:
+            files.append(
+                {
+                    "path": root.name,
+                    "size": root.stat().st_size,
+                    "suffix": root.suffix.lower(),
+                    "signals": classify(root.name),
+                }
+            )
+            source_kind = "file"
+
+        signal_counts = {category: 0 for category in signal_terms}
+        suffix_counts: dict[str, int] = {}
+        for file_info in files:
+            suffix = file_info["suffix"] or "<none>"
+            suffix_counts[suffix] = suffix_counts.get(suffix, 0) + 1
+            for signal in file_info["signals"]:
+                signal_counts[signal] += 1
+
+        top_files = sorted(files, key=lambda item: item["size"], reverse=True)[:50]
+        total_bytes = sum(item["size"] for item in files)
+        return {
+            "path": str(root),
+            "kind": source_kind,
+            "file_count": len(files),
+            "total_bytes": total_bytes,
+            "suffix_counts": dict(sorted(suffix_counts.items())),
+            "signal_counts": signal_counts,
+            "top_files": top_files,
+            "suggested_assertions": [
+                "Require at least one pose/tracking-related file before treating a dataset as useful replay evidence.",
+                "Compare file_count, total_bytes, and signal_counts between known-good and failing captures.",
+                "Keep camera/screen/audio capture optional because those artifacts can be large and privacy-sensitive.",
+            ],
+        }
+
+    def steam_frame_replay_script_template(self, kind: str = "full") -> dict[str, Any]:
+        clean = kind.lower().replace("-", "_")
+        templates = {
+            "launch_regression": {
+                "status": "available_now",
+                "records": "devkit upload/run commands, process/log assertions, collected artifacts",
+                "template": {
+                    "kind": "launch_regression",
+                    "gameid": "mygame",
+                    "steps": [
+                        {"tool": "upload_title", "clean": False},
+                        {"tool": "run_title"},
+                        {"wait_seconds": 20},
+                        {"tool": "adb_lepton_app_diagnostics", "assert_process_alive": True},
+                        {"tool": "steam_logs_manifest", "patterns": ["xr", "error", "crash"]},
+                        {"tool": "steam_frame_perfcriteria", "assert_no_failure": True},
+                    ],
+                },
+            },
+            "adb_input_replay": {
+                "status": "available_when_lepton_adb_is_connected",
+                "records": "allowlisted Android input/am/dumpsys steps plus logcat assertions",
+                "template": {
+                    "kind": "adb_input_replay",
+                    "serial": "frame:5555",
+                    "allowed_shell_prefixes": ["input ", "am ", "monkey ", "dumpsys "],
+                    "steps": [
+                        {"adb": "input keyevent KEYCODE_BUTTON_A"},
+                        {"adb": "input tap 960 540"},
+                        {"adb": "dumpsys activity activities", "assert_contains": "ResumedActivity"},
+                        {"tool": "adb_logcat", "lines": 300, "assert_not_contains": ["FATAL EXCEPTION"]},
+                    ],
+                },
+            },
+            "cef_ui_replay": {
+                "status": "available_after_cdp_client_is_added",
+                "records": "Chrome DevTools Protocol page selection, click/type/evaluate, screenshots, assertions",
+                "template": {
+                    "kind": "cef_ui_replay",
+                    "page_selector": {"url_contains": "steam"},
+                    "steps": [
+                        {"tool": "steam_frame_cef_pages"},
+                        {"cdp": "Runtime.evaluate", "expression": "document.title"},
+                        {"cdp": "Input.dispatchMouseEvent", "type": "mousePressed", "x": 100, "y": 100},
+                        {"cdp": "Input.dispatchMouseEvent", "type": "mouseReleased", "x": 100, "y": 100},
+                        {"tool": "screenshot", "assert_changed": True},
+                    ],
+                },
+            },
+            "tracking_dataset_capture": {
+                "status": "manual_or_future_cef_automation",
+                "records": "SteamVR Developer settings tracking capture plus dataset analysis",
+                "template": {
+                    "kind": "tracking_dataset_capture",
+                    "include": {"camera": False, "screen": False, "audio": False},
+                    "steps": [
+                        {"manual": "Open SteamVR Developer settings and START Record Tracking Data."},
+                        {"run": "Reproduce the issue or scripted game sequence."},
+                        {"manual": "STOP Record Tracking Data."},
+                        {"tool": "steam_frame_tracking_datasets"},
+                        {"tool": "sync_tracking_dataset"},
+                        {"tool": "tracking_dataset_analyze"},
+                    ],
+                },
+            },
+            "pose_driver_replay": {
+                "status": "future_custom_driver_required",
+                "records": "scripted HMD/controller pose keyframes for a custom driver or OpenXR API layer",
+                "template": {
+                    "kind": "pose_driver_replay",
+                    "coordinate_space": "standing",
+                    "rate_hz": 90,
+                    "actors": ["hmd", "left_controller", "right_controller"],
+                    "steps": [
+                        {"time_ms": 0, "actor": "hmd", "pose": {"position": [0, 1.6, 0]}},
+                        {
+                            "time_ms": 0,
+                            "actor": "right_controller",
+                            "pose": {"position": [0.25, 1.25, -0.45], "orientation_xyzw": [0, 0, 0, 1]},
+                        },
+                        {
+                            "time_ms": 500,
+                            "actor": "right_controller",
+                            "pose": {"position": [0.3, 1.2, -0.7], "orientation_xyzw": [0, 0, 0, 1]},
+                        },
+                    ],
+                },
+                "notes": [
+                    "No validated public Steam Frame CLI currently consumes this template.",
+                    "Use this shape for a custom OpenVR server driver or OpenXR API-layer prototype.",
+                ],
+            },
+        }
+        if clean == "full":
+            selected = templates
+        elif clean in templates:
+            selected = {clean: templates[clean]}
+        else:
+            raise DevkitAdapterError(f"kind must be 'full' or one of: {', '.join(sorted(templates))}")
+        return {
+            "kind": clean,
+            "templates": selected,
+            "recording_strategy": [
+                "Record deterministic launch/log checks first.",
+                "Record ADB and CEF UI actions as allowlisted commands with assertions.",
+                "Use tracking datasets as captured evidence today.",
+                "Use pose keyframes only with a custom driver/API-layer executor until a native replay hook is validated.",
+            ],
+        }
+
+    def steam_frame_automation_plan(self, scenario: str = "full") -> dict[str, Any]:
+        clean = scenario.lower().replace("-", "_")
+        scenarios = {
+            "full",
+            "pose_replay",
+            "input_replay",
+            "ui_replay",
+            "launch_regression",
+            "android_lepton",
+            "pc_synthetic",
+        }
+        if clean not in scenarios:
+            raise DevkitAdapterError(f"scenario must be one of: {', '.join(sorted(scenarios))}")
+        plans = {
+            "pose_replay": {
+                "status": "not_directly_available_yet",
+                "what_is_known": [
+                    "Steam Frame docs describe recording tracking datasets that Valve can replay for HMD/controller pose analysis.",
+                    "The recorded dataset root is ~/.config/openvr/config/cv/xrservice/datasets.",
+                    "The current dump did not expose a public replay CLI or pose injection command.",
+                ],
+                "mcp_tools": [
+                    "steam_frame_tracking_datasets",
+                    "sync_tracking_dataset",
+                    "steam_frame_automation_inventory",
+                    "local_steamvr_automation_inventory",
+                ],
+                "next_build_options": [
+                    "Find or build an xrservice dataset replay CLI if available in future OS builds.",
+                    "Build a custom OpenVR server driver that publishes scripted HMD/controller poses.",
+                    "Build an OpenXR API layer for app-local pose/action replay when runtime-level injection is not possible.",
+                ],
+            },
+            "input_replay": {
+                "status": "partially_available",
+                "what_is_known": [
+                    "Lepton Android apps can be driven through ADB once connected.",
+                    "Steam Frame controllers expose Frame-specific SteamVR input profiles and bindings.",
+                ],
+                "mcp_tools": [
+                    "adb_devices",
+                    "adb_shell with confirmation for input keyevent/tap/text commands",
+                    "dump_controller_config",
+                    "local_steamvr_automation_inventory",
+                ],
+                "next_build_options": [
+                    "Add curated adb_input_keyevent/tap/text tools so common replay does not require arbitrary adb_shell.",
+                    "Add action-manifest and binding validators for game-specific Steam Input replay coverage.",
+                ],
+            },
+            "ui_replay": {
+                "status": "available_for_steam_ui",
+                "what_is_known": [
+                    "Steam and SteamVR CEF remote-debug ports are exposed on Steam Frame.",
+                    "Browser automation can drive visible Steam/SteamVR web UI when the correct page is selected.",
+                ],
+                "mcp_tools": [
+                    "steam_frame_web_ports",
+                    "steam_frame_cef_pages",
+                    "screenshot",
+                    "journalctl_tail",
+                ],
+                "next_build_options": [
+                    "Add a CEF page selector plus click/type wrapper over the Chrome DevTools Protocol.",
+                    "Record page actions as a JSON replay script with screenshot/log assertions.",
+                ],
+            },
+            "launch_regression": {
+                "status": "available",
+                "what_is_known": [
+                    "The existing devkit upload/run/log/perfcriteria tools cover repeatable launch smoke tests.",
+                    "This is the most reliable automation lane today because it does not require synthetic tracking.",
+                ],
+                "mcp_tools": [
+                    "upload_title",
+                    "run_title",
+                    "steam_logs_manifest",
+                    "steam_frame_perfcriteria",
+                    "adb_lepton_app_diagnostics",
+                    "lepton_artifacts_manifest",
+                ],
+                "next_build_options": [
+                    "Add a declarative smoke-test runner that sequences upload, launch, wait, collect, and assert.",
+                    "Add reusable assertions for process alive, XR session synchronized, perfcriteria status, and log highlights.",
+                ],
+            },
+            "android_lepton": {
+                "status": "available_for_adb_and_logs",
+                "what_is_known": [
+                    "ADB can automate Android-level input and collect logs/bugreports.",
+                    "Lepton exposes perfetto, strace, bootchart, RenderDoc, gdb, and lldb workflows.",
+                ],
+                "mcp_tools": [
+                    "adb_connect_lepton_wifi",
+                    "adb_logcat",
+                    "adb_bugreport",
+                    "lepton_debug_plan",
+                    "lepton_artifacts_manifest",
+                ],
+                "next_build_options": [
+                    "Add curated Lepton perfetto/strace capture tools with confirmation.",
+                    "Add curated ADB input replay tools and JSON script playback.",
+                ],
+            },
+            "pc_synthetic": {
+                "status": "available_for_hmd_baseline",
+                "what_is_known": [
+                    "The local SteamVR install includes Valve's null driver.",
+                    "The null driver can provide a synthetic HMD baseline for PC-side testing, not Frame controller pose replay.",
+                ],
+                "mcp_tools": ["local_steamvr_automation_inventory"],
+                "next_build_options": [
+                    "Add a gated SteamVR null-driver enable/disable helper.",
+                    "Build a custom driver if scripted controller poses are required.",
+                ],
+            },
+        }
+        selected = plans if clean == "full" else {clean: plans[clean]}
+        return {
+            "scenario": clean,
+            "plans": selected,
+            "recommended_order": [
+                "Start with launch_regression automation.",
+                "Add ADB/UI replay for deterministic non-pose interactions.",
+                "Use tracking datasets for capture/download evidence.",
+                "Only then build pose injection through a custom driver or discovered dataset replay binary.",
+            ],
+        }
+
+    def _resolve_steamvr_root(self, steamvr_root: str | None = None) -> Path | None:
+        candidates: list[Path] = []
+        if steamvr_root:
+            candidates.append(Path(steamvr_root).expanduser())
+        env_root = os.environ.get("STEAMVR_ROOT")
+        if env_root:
+            candidates.append(Path(env_root).expanduser())
+        if platform.system() == "Windows":
+            candidates.append(Path(r"C:\Program Files (x86)\Steam\steamapps\common\SteamVR"))
+        else:
+            candidates += [
+                Path.home() / ".steam/steam/steamapps/common/SteamVR",
+                Path.home() / ".local/share/Steam/steamapps/common/SteamVR",
+            ]
+        for candidate in candidates:
+            if candidate.is_dir():
+                return candidate
+        return None
 
     def steam_services(
         self,

@@ -118,6 +118,12 @@ steam_frame_openxr_status(target="frame")
 lepton_graphics_debug_status(target="frame")
 steam_frame_tracking_datasets(target="frame")
 sync_tracking_dataset(target="frame", output_folder="C:\path\to\datasets")
+local_steamvr_automation_inventory()
+steam_frame_automation_inventory(target="frame")
+steam_frame_automation_plan(scenario="pose_replay")
+steamvr_vrcmd_capability_inventory()
+tracking_dataset_analyze(dataset_path="C:\path\to\dataset")
+steam_frame_replay_script_template(kind="pose_driver_replay")
 deckard_power_status(target="frame")
 pidbridge_status(target="frame")
 deckard_runtime_environment(target="frame")
@@ -143,6 +149,46 @@ The second-pass tools line up with Valve's Steam Frame docs for OpenXR runtime s
 Vulkan-layer launch debugging, perfetto/strace artifact handling, and tracking dataset collection.
 They report existing state by default; `sync_tracking_dataset` is a local artifact download helper
 for datasets recorded through the headset's SteamVR Developer settings.
+
+## Steam Frame Automation
+
+The automation tools focus on repeatable game testing without pretending there is a public controller
+pose injection command when one has not been found:
+
+```python
+local_steamvr_automation_inventory()
+steam_frame_automation_inventory(target="frame")
+steam_frame_automation_plan(scenario="full")
+steam_frame_automation_plan(scenario="launch_regression")
+steam_frame_automation_plan(scenario="pose_replay")
+steam_frame_replay_script_template(kind="full")
+steam_frame_tracking_datasets(target="frame")
+sync_tracking_dataset(target="frame", output_folder="C:\path\to\datasets")
+tracking_dataset_analyze(dataset_path="C:\path\to\datasets\latest")
+steamvr_vrcmd_capability_inventory()
+steam_frame_cef_pages(target="frame")
+steam_frame_web_ports(target="frame")
+adb_logcat(serial="frame:5555", lines=300)
+```
+
+Current reliable lanes are launch/log regression, Lepton ADB input/log capture, Steam/SteamVR CEF UI
+inspection, and SteamVR tracking-dataset collection/download. `local_steamvr_automation_inventory`
+also checks the host SteamVR install for the null driver and Frame controller input profiles, which
+are useful for PC-side synthetic HMD baselines and binding validation.
+
+`steamvr_vrcmd_capability_inventory` scans local SteamVR binaries for capture/replay/polling and
+driver-simulation strings. Treat those as capability leads, not proven Steam Frame controls, until a
+separate tool validates the command behavior. `steam_frame_replay_script_template` returns JSON
+shapes for launch regression, ADB input replay, CEF UI replay, tracking-dataset capture, and future
+custom-driver pose replay. `tracking_dataset_analyze` summarizes downloaded datasets so captures can
+be compared across known-good and failing runs.
+
+Controller or HMD pose replay is tracked as a future build path. The docs and live files expose
+recorded tracking datasets under `~/.config/openvr/config/cv/xrservice/datasets`, but no validated
+public Steam Frame CLI for replaying those datasets or injecting arbitrary controller poses has been
+found. The practical next implementations are a confirmation-gated CEF replay recorder, curated ADB
+input replay, declarative launch smoke tests, and then a custom OpenVR server driver or OpenXR API
+layer if scripted pose control is required.
 
 DBus control methods, Lepton debug-server lifecycle, RenderDoc/Vulkan layer injection, tracking
 dataset packaging, Mesa debug package installation, and coredump debugger backtraces should be

@@ -89,6 +89,12 @@ def create_server() -> FastMCP:
                 "steam_frame_openxr_status",
                 "lepton_graphics_debug_status",
                 "steam_frame_tracking_datasets",
+                "local_steamvr_automation_inventory",
+                "steam_frame_automation_inventory",
+                "steam_frame_automation_plan",
+                "steamvr_vrcmd_capability_inventory",
+                "tracking_dataset_analyze",
+                "steam_frame_replay_script_template",
                 "deckard_power_status",
                 "pidbridge_status",
                 "deckard_runtime_environment",
@@ -184,6 +190,12 @@ def create_server() -> FastMCP:
                 "steam_frame_openxr_status",
                 "lepton_graphics_debug_status",
                 "steam_frame_tracking_datasets",
+                "local_steamvr_automation_inventory",
+                "steam_frame_automation_inventory",
+                "steam_frame_automation_plan",
+                "steamvr_vrcmd_capability_inventory",
+                "tracking_dataset_analyze",
+                "steam_frame_replay_script_template",
                 "deckard_power_status",
                 "pidbridge_status",
                 "deckard_runtime_environment",
@@ -219,6 +231,8 @@ def create_server() -> FastMCP:
                 "SteamOS Manager DBus controls discovered from introspection/decompile",
                 "Deckard runtime/state writes such as charger power_event",
                 "Tracking dataset capture start/stop and packaging",
+                "Curated ADB input replay and Steam/SteamVR CEF replay scripts",
+                "Custom driver or API-layer based controller/HMD pose replay",
             ],
         }
 
@@ -1083,6 +1097,72 @@ def create_server() -> FastMCP:
             "sync_tracking_dataset",
             SafetyLevel.WRITE,
             lambda: adapter.sync_tracking_dataset(ref, output_folder, dataset_path),
+        )
+
+    @mcp.tool()
+    def local_steamvr_automation_inventory(steamvr_root: str | None = None) -> dict[str, Any]:
+        """Inspect local SteamVR automation surfaces such as null driver and Frame controller profiles."""
+        return _run_tool(
+            operations,
+            "local_steamvr_automation_inventory",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.local_steamvr_automation_inventory(steamvr_root),
+        )
+
+    @mcp.tool()
+    def steam_frame_automation_inventory(
+        target: str,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Inspect Steam Frame automation surfaces for tracking datasets, CEF ports, Lepton, and input tools."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "steam_frame_automation_inventory",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.steam_frame_automation_inventory(ref),
+        )
+
+    @mcp.tool()
+    def steam_frame_automation_plan(scenario: str = "full") -> dict[str, Any]:
+        """Return automation strategy notes for launch, UI, ADB, tracking-dataset, and pose-replay workflows."""
+        return _run_tool(
+            operations,
+            "steam_frame_automation_plan",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.steam_frame_automation_plan(scenario),
+        )
+
+    @mcp.tool()
+    def steamvr_vrcmd_capability_inventory(steamvr_root: str | None = None) -> dict[str, Any]:
+        """Inspect local SteamVR binaries for capture, replay, polling, and driver simulation string evidence."""
+        return _run_tool(
+            operations,
+            "steamvr_vrcmd_capability_inventory",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.steamvr_vrcmd_capability_inventory(steamvr_root),
+        )
+
+    @mcp.tool()
+    def tracking_dataset_analyze(dataset_path: str) -> dict[str, Any]:
+        """Summarize a local SteamVR tracking dataset directory or zip after download."""
+        return _run_tool(
+            operations,
+            "tracking_dataset_analyze",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.tracking_dataset_analyze(dataset_path),
+        )
+
+    @mcp.tool()
+    def steam_frame_replay_script_template(kind: str = "full") -> dict[str, Any]:
+        """Return JSON templates for launch, ADB, CEF UI, tracking capture, and future pose replay scripts."""
+        return _run_tool(
+            operations,
+            "steam_frame_replay_script_template",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.steam_frame_replay_script_template(kind),
         )
 
     @mcp.tool()

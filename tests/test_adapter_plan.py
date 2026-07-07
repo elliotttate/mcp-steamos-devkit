@@ -628,3 +628,144 @@ def test_sync_tracking_dataset_downloads_latest_dataset(tmp_path: Path, monkeypa
             "/home/steamos/.config/openvr/config/cv/xrservice/datasets/dataset-new",
         )
     ]
+
+
+def test_local_steamvr_automation_inventory_reads_driver_surfaces(tmp_path: Path) -> None:
+    adapter = make_adapter(tmp_path)
+    steamvr = tmp_path / "SteamVR"
+    null_settings = steamvr / "drivers" / "null" / "resources" / "settings" / "default.vrsettings"
+    frame_input = steamvr / "drivers" / "frame_controller" / "resources" / "input"
+    null_settings.parent.mkdir(parents=True)
+    frame_input.mkdir(parents=True)
+    null_settings.write_text('{"driver_null": {"enable": false}}', encoding="utf-8")
+    (frame_input / "frame_controller_profile.json").write_text(
+        """
+{
+  "controller_type": "frame_controller",
+  "input_source": {
+    "/input/grip/pose": {"type": "pose"},
+    "/input/trigger/value": {"type": "scalar"}
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    (frame_input / "binding_vrmonitor.json").write_text("{}", encoding="utf-8")
+
+    result = adapter.local_steamvr_automation_inventory(str(steamvr))
+
+    assert result["ok"]
+    assert "null" in result["drivers"]
+    assert result["null_driver"]["exists"]
+    assert result["null_driver"]["default_settings"]["driver_null"]["enable"] is False
+    assert result["frame_controller"]["controller_type"] == "frame_controller"
+    assert result["frame_controller"]["pose_paths"] == ["/input/grip/pose"]
+    assert "binding_vrmonitor.json" in result["frame_controller"]["binding_files"]
+    assert any(cap["name"] == "pc_synthetic_hmd" and cap["available"] for cap in result["capabilities"])
+    assert any(
+        cap["name"] == "controller_pose_replay" and not cap["available"]
+        for cap in result["capabilities"]
+    )
+
+
+def test_steam_frame_automation_inventory_builds_expected_remote_script(tmp_path: Path, monkeypatch) -> None:
+    adapter = make_adapter(tmp_path)
+    device = DeviceInfo(id="frame", name="frame", address="frame", login="steamos")
+    scripts: list[str] = []
+
+    monkeypatch.setattr(adapter, "resolve_device", lambda ref: device)
+
+    def fake_remote_python_json(resolved: DeviceInfo, script: str, **kwargs: Any) -> dict[str, Any]:
+        del resolved, kwargs
+        scripts.append(script)
+        return {
+            "steamvr": {"path": "/home/steamos/.steam/steam/steamapps/common/SteamVR"},
+            "tracking_datasets": {"root": "/home/steamos/.config/openvr/config/cv/xrservice/datasets"},
+            "tools": {"adb": "/usr/bin/adb", "evemu-record": None},
+            "capabilities": {"android_input_via_adb": True},
+        }
+
+    monkeypatch.setattr(adapter, "_remote_python_json", fake_remote_python_json)
+
+    result = adapter.steam_frame_automation_inventory(DeviceRef("frame"))
+
+    assert result["device"]["name"] == "frame"
+    assert result["capabilities"]["android_input_via_adb"]
+    assert "xrservice/datasets" in scripts[0]
+    assert "evemu-record" in scripts[0]
+    assert "steamvr_binaries" in scripts[0]
+    assert "lepton_help" in scripts[0]
+    assert any("Tracking datasets" in note for note in result["notes"])
+
+
+def test_steam_frame_automation_plan_covers_pose_replay(tmp_path: Path) -> None:
+    adapter = make_adapter(tmp_path)
+
+    result = adapter.steam_frame_automation_plan("pose-replay")
+
+    pose_plan = result["plans"]["pose_replay"]
+    assert pose_plan["status"] == "not_directly_available_yet"
+    assert "sync_tracking_dataset" in pose_plan["mcp_tools"]
+    assert any("custom OpenVR server driver" in option for option in pose_plan["next_build_options"])
+
+    with pytest.raises(DevkitAdapterError):
+        adapter.steam_frame_automation_plan("unknown")
+
+
+def test_steamvr_vrcmd_capability_inventory_reads_binary_tokens(tmp_path: Path) -> None:
+    adapter = make_adapter(tmp_path)
+    steamvr = tmp_path / "SteamVR"
+    for bin_dir in [steamvr / "bin" / "win64", steamvr / "bin" / "linux64"]:
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "vrcmd.exe").write_bytes(b"--pollposes --replay --startcapture --send-vrevent")
+        (bin_dir / "vrserver.exe").write_bytes(b"simulate_hmd forcedDriver activateMultipleDrivers")
+        (bin_dir / "vrpathreg.exe").write_bytes(b"")
+        (bin_dir / "vrcmd").write_bytes(b"--pollposes --replay --startcapture --send-vrevent")
+        (bin_dir / "vrserver").write_bytes(b"simulate_hmd forcedDriver activateMultipleDrivers")
+        (bin_dir / "vrpathreg").write_bytes(b"")
+
+    result = adapter.steamvr_vrcmd_capability_inventory(str(steamvr))
+
+    assert result["ok"]
+    assert "--replay" in result["categories"]["capture_replay"]
+    assert "--pollposes" in result["categories"]["pose_polling"]
+    assert "--send-vrevent" in result["categories"]["event_injection"]
+    assert "simulate_hmd" in result["categories"]["driver_simulation"]
+    assert any(
+        cap["name"] == "host_capture_replay_tokens" and cap["available"]
+        for cap in result["capabilities"]
+    )
+
+
+def test_tracking_dataset_analyze_summarizes_capture_files(tmp_path: Path) -> None:
+    adapter = make_adapter(tmp_path)
+    dataset = tmp_path / "dataset"
+    (dataset / "camera").mkdir(parents=True)
+    (dataset / "hmd_pose.bin").write_bytes(b"pose")
+    (dataset / "controller_pose.json").write_text("{}", encoding="utf-8")
+    (dataset / "camera" / "frame.raw").write_bytes(b"camera")
+    (dataset / "audio.wav").write_bytes(b"audio")
+
+    result = adapter.tracking_dataset_analyze(str(dataset))
+
+    assert result["kind"] == "directory"
+    assert result["file_count"] == 4
+    assert result["signal_counts"]["hmd"] == 1
+    assert result["signal_counts"]["controller"] == 1
+    assert result["signal_counts"]["pose"] == 2
+    assert result["signal_counts"]["audio"] == 1
+    assert result["total_bytes"] > 0
+
+
+def test_steam_frame_replay_script_template_documents_pose_driver_future(tmp_path: Path) -> None:
+    adapter = make_adapter(tmp_path)
+
+    result = adapter.steam_frame_replay_script_template("pose-driver-replay")
+
+    template = result["templates"]["pose_driver_replay"]
+    assert template["status"] == "future_custom_driver_required"
+    assert template["template"]["actors"] == ["hmd", "left_controller", "right_controller"]
+    assert any(step.get("actor") == "right_controller" for step in template["template"]["steps"])
+
+    with pytest.raises(DevkitAdapterError):
+        adapter.steam_frame_replay_script_template("unknown")
