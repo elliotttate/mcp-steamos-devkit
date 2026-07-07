@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Callable
 
@@ -63,17 +64,31 @@ def create_server() -> FastMCP:
                 "adb_doctor",
                 "adb_devices",
                 "adb_logcat without clear_first",
-                "adb_bugreport",
                 "inspect_android_apk",
                 "validate_android_split_package",
                 "adb_lepton_app_diagnostics",
+                "lepton_cli_help",
+                "lepton_containers",
+                "lepton_logcat",
+                "steam_logs_manifest",
+                "steam_frame_perfcriteria",
+                "steam_frame_cef_pages",
+                "steam_frame_web_ports",
+                "steam_frame_dbus_manager",
+                "native_adbd_status",
+                "coredump_list",
+                "steam_services",
+                "journalctl_tail",
+                "steam_frame_dev_inventory",
             ],
             "write": [
                 "sync_devkit_utils",
                 "upload_title without clean delete",
                 "run_title",
+                "sync_logs",
                 "ADB connect/disconnect/forward/reverse",
                 "adb_install_apk",
+                "adb_bugreport",
                 "adb_unreal_insights_setup",
                 "stage_android_obb_layout",
             ],
@@ -123,6 +138,52 @@ def create_server() -> FastMCP:
                 "adb_lepton_app_diagnostics for app pid/activity/OBB/env and XR/Steam log highlights",
                 "adb_bugreport for a zip/text bugreport artifact",
                 "adb_unreal_insights_setup to set debug.ue.commandline and reverse tcp:1981",
+            ],
+        }
+
+    @mcp.resource("steamos-devkit://help/steam-frame-dev")
+    def steam_frame_dev_help() -> dict[str, Any]:
+        return {
+            "scope": "Steam Frame native SteamOS plus Lepton Android runtime diagnostics",
+            "safe_discovery_tools": [
+                "lepton_cli_help",
+                "lepton_containers",
+                "lepton_logcat",
+                "steam_logs_manifest",
+                "steam_frame_perfcriteria",
+                "steam_frame_cef_pages",
+                "steam_frame_web_ports",
+                "steam_frame_dbus_manager",
+                "native_adbd_status",
+                "coredump_list",
+                "steam_services",
+                "journalctl_tail",
+                "steam_frame_dev_inventory",
+                "adb_lepton_app_diagnostics",
+            ],
+            "live_surfaces_found": [
+                "Lepton CLI verbs include ps/list_containers, collect_logs, perfetto, extract, "
+                "gdb/lldb server helpers, RenderDoc, strace, and bootchart.",
+                "Lepton podman labels expose adb_port, gdb_port, lldb_port, PREFIX, and "
+                "STEAM_COMPAT_DATA_PATH.",
+                "Steam Frame user services include SteamVR, Gamescope session, pidbridge, Steam, "
+                "SteamVR log scraper, and SteamOS Manager.",
+                "Steam Frame system services include the devkit service, Steam/SteamVR CEF "
+                "port forwards, and native USB ADB.",
+            ],
+            "decompile_candidates": [
+                "steamos-manager",
+                "pidbridge",
+                "apk-info-extractor",
+                "deckard helper binaries",
+                "SteamOS Manager DBus interface consumers",
+            ],
+            "gated_future_controls": [
+                "Lepton perfetto/bootchart capture",
+                "Lepton collect_logs/extract",
+                "Lepton gdb/lldb server lifecycle",
+                "RenderDoc/Vulkan validation/FDM/strace launch toggles",
+                "SteamOS Manager DBus controls discovered from introspection/decompile",
             ],
         }
 
@@ -591,8 +652,229 @@ def create_server() -> FastMCP:
         return _run_tool(
             operations,
             "sync_logs",
-            SafetyLevel.READ_ONLY,
+            SafetyLevel.WRITE,
             lambda: adapter.sync_logs(ref, local_folder, steamvr_logpath, device_name),
+        )
+
+    @mcp.tool()
+    def lepton_cli_help(
+        target: str,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Read Steam Frame's installed Lepton CLI help from the native SteamOS shell."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "lepton_cli_help",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.lepton_cli_help(ref),
+        )
+
+    @mcp.tool()
+    def lepton_containers(
+        target: str,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """List Lepton podman containers with ADB/GDB/LLDB ports and debug labels."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "lepton_containers",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.lepton_containers(ref),
+        )
+
+    @mcp.tool()
+    def lepton_logcat(
+        target: str,
+        context: str = "dev",
+        lines: int = 300,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Collect bounded native Lepton logcat output for a Lepton context."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "lepton_logcat",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.lepton_logcat(ref, context, lines),
+        )
+
+    @mcp.tool()
+    def steam_logs_manifest(
+        target: str,
+        pattern: str | None = None,
+        limit: int = 100,
+        include_tmp: bool = False,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """List recent Steam, SteamVR, OpenXR, Lepton, trace, and dump files on the device."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "steam_logs_manifest",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.steam_logs_manifest(ref, pattern, limit, include_tmp),
+        )
+
+    @mcp.tool()
+    def steam_frame_perfcriteria(
+        target: str,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Find and parse Steam Frame perfcriteria.txt compatibility/performance reports."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "steam_frame_perfcriteria",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.steam_frame_perfcriteria(ref),
+        )
+
+    @mcp.tool()
+    def steam_frame_cef_pages(
+        target: str,
+        ports: list[int] | None = None,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Enumerate Steam/SteamVR CEF DevTools pages exposed on Steam Frame debug ports."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "steam_frame_cef_pages",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.steam_frame_cef_pages(ref, ports),
+        )
+
+    @mcp.tool()
+    def steam_frame_web_ports(
+        target: str,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Inspect known Steam Frame web/debug/listener ports and devkit HTTP properties."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "steam_frame_web_ports",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.steam_frame_web_ports(ref),
+        )
+
+    @mcp.tool()
+    def steam_frame_dbus_manager(
+        target: str,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Introspect SteamOS Manager DBus interfaces/properties without invoking control methods."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "steam_frame_dbus_manager",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.steam_frame_dbus_manager(ref),
+        )
+
+    @mcp.tool()
+    def native_adbd_status(
+        target: str,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Read native SteamOS adbd.service status and environment."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "native_adbd_status",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.native_adbd_status(ref),
+        )
+
+    @mcp.tool()
+    def coredump_list(
+        target: str,
+        limit: int = 20,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """List recent Steam Frame native coredumps without opening them in a debugger."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "coredump_list",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.coredump_list(ref, limit),
+        )
+
+    @mcp.tool()
+    def steam_services(
+        target: str,
+        scope: str = "user",
+        pattern: str | None = None,
+        limit: int = 200,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """List Steam Frame systemd services, usually filtered by steam/steamvr/gamescope/lepton."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "steam_services",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.steam_services(ref, scope, pattern, limit),
+        )
+
+    @mcp.tool()
+    def journalctl_tail(
+        target: str,
+        unit: str,
+        lines: int = 200,
+        scope: str = "user",
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Tail bounded journal lines for a specific user or system service unit."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "journalctl_tail",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.journalctl_tail(ref, unit, lines, scope),
+        )
+
+    @mcp.tool()
+    def steam_frame_dev_inventory(
+        target: str,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Collect a bounded read-only inventory of Steam Frame OS, Lepton, services, DBus, and binary strings."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "steam_frame_dev_inventory",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.steam_frame_dev_inventory(ref),
         )
 
     @mcp.tool()
@@ -785,7 +1067,7 @@ def create_server() -> FastMCP:
         return _run_tool(
             operations,
             "adb_bugreport",
-            SafetyLevel.READ_ONLY,
+            SafetyLevel.WRITE,
             lambda: adapter.adb_bugreport(output_path, serial),
         )
 
@@ -875,8 +1157,69 @@ def _run_tool(
         operations.fail(op.id, str(exc))
         raise
     result = to_jsonable(result)
-    operations.finish(op.id, result if isinstance(result, dict) else {"value": result})
+    operations.finish(op.id, _operation_result_summary(name, result))
     return {"operation_id": op.id, "result": result}
+
+
+def _operation_result_summary(name: str, result: Any) -> dict[str, Any]:
+    return {
+        "tool": name,
+        "summary": _compact_value(result),
+    }
+
+
+def _compact_value(value: Any, depth: int = 0) -> Any:
+    value = redact(to_jsonable(value))
+    if depth >= 3:
+        return _shape(value)
+    if isinstance(value, dict):
+        compact: dict[str, Any] = {"keys": list(value.keys())[:40]}
+        for key in ("device", "exit_status", "returncode", "local_path", "local_folder", "url"):
+            if key in value:
+                compact[key] = _compact_value(value[key], depth + 1)
+        for key, item in value.items():
+            if key in compact:
+                continue
+            if isinstance(item, list):
+                compact[key] = {"count": len(item), "sample": [_compact_value(x, depth + 1) for x in item[:3]]}
+            elif isinstance(item, dict):
+                compact[key] = _compact_value(item, depth + 1)
+            elif isinstance(item, str):
+                compact[key] = _compact_string(item)
+            else:
+                compact[key] = item
+            if _json_size(compact) > 12000:
+                compact["truncated"] = True
+                break
+        return compact
+    if isinstance(value, list):
+        return {"count": len(value), "sample": [_compact_value(item, depth + 1) for item in value[:3]]}
+    if isinstance(value, str):
+        return _compact_string(value)
+    return value
+
+
+def _compact_string(value: str) -> dict[str, Any] | str:
+    if len(value) <= 500:
+        return value
+    return {"length": len(value), "preview": value[:500], "truncated": True}
+
+
+def _shape(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {"type": "object", "keys": list(value.keys())[:40]}
+    if isinstance(value, list):
+        return {"type": "list", "count": len(value)}
+    if isinstance(value, str):
+        return _compact_string(value)
+    return value
+
+
+def _json_size(value: Any) -> int:
+    try:
+        return len(json.dumps(value, ensure_ascii=False))
+    except TypeError:
+        return len(str(value))
 
 
 def _device_ref(

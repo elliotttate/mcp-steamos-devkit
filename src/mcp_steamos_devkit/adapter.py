@@ -69,6 +69,8 @@ DEBUG_MODE = {
 }
 
 ANDROID_PACKAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$")
+LEPTON_CONTEXT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+SYSTEMD_UNIT_RE = re.compile(r"^[A-Za-z0-9@_.:+\\-]+\.(service|socket|target|timer|path|mount)$")
 ADB_LOG_HIGHLIGHT_RE = re.compile(
     r"Unity|XR|OpenXR|SteamAPI|Steamworks|NullReference|Exception|FATAL|"
     r"Display \(1\)|header mismatch|XR_ERROR|TMP|Error loading subsystem|Fully drawn",
@@ -665,6 +667,797 @@ class SteamOSDevkitAdapter:
         self.rsync_transfer(str(local_device_folder), device, sources, upload=False)
         return {"device": to_jsonable(device), "local_folder": str(local_device_folder), "sources": sources}
 
+    def lepton_cli_help(self, ref: DeviceRef) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        command = (
+            'LEPTON="$HOME/.local/share/Steam/steamapps/common/Lepton/lepton"; '
+            'if [ -x "$LEPTON" ]; then "$LEPTON" help; else echo "Lepton CLI not found: $LEPTON"; exit 127; fi'
+        )
+        out, err, status = self.simple_ssh(device, command, silent=True)
+        return {"device": to_jsonable(device), "exit_status": status, "stdout": out, "stderr": err}
+
+    def lepton_containers(self, ref: DeviceRef) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        data = self._remote_python_json(
+            device,
+            r"""
+import json
+import subprocess
+import sys
+import os
+
+
+def run(args):
+    return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+
+
+ps = run(["podman", "ps", "-a", "--filter", "label=lepton=true", "--format", "{{.Names}}"])
+result = {"containers": [], "stderr": ps.stderr.strip(), "returncode": ps.returncode}
+if ps.returncode != 0:
+    print(json.dumps(result))
+    sys.exit(0)
+
+for name in [line.strip() for line in ps.stdout.splitlines() if line.strip()]:
+    inspect = run(["podman", "inspect", name])
+    if inspect.returncode != 0:
+        result["containers"].append(
+            {"name": name, "inspect_error": inspect.stderr.strip(), "inspect_returncode": inspect.returncode}
+        )
+        continue
+    try:
+        payload = json.loads(inspect.stdout)
+    except json.JSONDecodeError as exc:
+        result["containers"].append({"name": name, "inspect_error": str(exc)})
+        continue
+    item = payload[0] if isinstance(payload, list) and payload else payload
+    labels = ((item.get("Config") or {}).get("Labels") or {})
+    state = item.get("State") or {}
+    clean_name = (item.get("Name") or name).lstrip("/")
+    context = clean_name.removeprefix("lepton-")
+    home = os.path.expanduser("~")
+    result["containers"].append(
+        {
+            "name": clean_name,
+            "context": context,
+            "id": item.get("Id"),
+            "status": state.get("Status"),
+            "running": bool(state.get("Running")),
+            "pid": state.get("Pid"),
+            "started_at": state.get("StartedAt"),
+            "finished_at": state.get("FinishedAt"),
+            "image": item.get("ImageName") or ((item.get("Config") or {}).get("Image")),
+            "labels": labels,
+            "ports": {
+                "adb": labels.get("adb_port"),
+                "gdb": labels.get("gdb_port"),
+                "lldb": labels.get("lldb_port"),
+            },
+            "prefix": labels.get("PREFIX"),
+            "steam_compat_data_path": labels.get("STEAM_COMPAT_DATA_PATH"),
+            "lepton_pid": labels.get("lepton_pid"),
+            "log_file": f"{home}/.local/share/Steam/logs/lepton-{context}.log",
+        }
+    )
+
+print(json.dumps(result))
+""",
+        )
+        for container in data.get("containers", []):
+            adb_port = container.get("ports", {}).get("adb")
+            if adb_port and device.address:
+                container["adb_target"] = f"{device.address}:{adb_port}"
+        return {"device": to_jsonable(device), **data}
+
+    def lepton_logcat(self, ref: DeviceRef, context: str = "dev", lines: int = 300) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        clean_context = context.strip()
+        if not LEPTON_CONTEXT_RE.fullmatch(clean_context):
+            raise DevkitAdapterError(f"Invalid Lepton context name: {context}")
+        bounded_lines = min(max(int(lines), 1), 5000)
+        command = (
+            'LEPTON="$HOME/.local/share/Steam/steamapps/common/Lepton/lepton"; '
+            'if [ ! -x "$LEPTON" ]; then echo "Lepton CLI not found: $LEPTON" >&2; exit 127; fi; '
+            f'timeout 8s "$LEPTON" logcat {shlex.quote(clean_context)} 2>&1 | tail -n {bounded_lines}'
+        )
+        out, err, status = self.simple_ssh(device, command, silent=True)
+        return {
+            "device": to_jsonable(device),
+            "context": clean_context,
+            "exit_status": status,
+            "stderr": err,
+            "lines": out.splitlines(),
+            "highlight_lines": _matching_lines(out, ADB_LOG_HIGHLIGHT_RE, limit=250),
+        }
+
+    def steam_logs_manifest(
+        self,
+        ref: DeviceRef,
+        pattern: str | None = None,
+        limit: int = 100,
+        include_tmp: bool = False,
+    ) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        bounded_limit = min(max(int(limit), 1), 500)
+        data = self._remote_python_json(
+            device,
+            "PATTERN = "
+            + json.dumps(pattern or "")
+            + "\nLIMIT = "
+            + str(bounded_limit)
+            + "\nINCLUDE_TMP = "
+            + ("True" if include_tmp else "False")
+            + r"""
+
+import fnmatch
+import json
+import os
+import time
+
+home = os.path.expanduser("~")
+roots = [os.path.join(home, ".local/share/Steam/logs")]
+if INCLUDE_TMP:
+    roots.append("/tmp")
+
+prefixes = (
+    "lepton",
+    "xrclient",
+    "vrclient",
+    "vrserver",
+    "vrcompositor",
+    "steam",
+    "gameprocess",
+    "compat",
+)
+extensions = (".log", ".txt", ".pftrace", ".dmp", ".mdmp", ".zip")
+
+
+def kind_for(name):
+    lowered = name.lower()
+    if lowered.startswith("lepton"):
+        return "lepton"
+    if lowered.startswith(("xrclient", "vrclient")):
+        return "openxr"
+    if lowered.startswith(("vrserver", "vrcompositor")):
+        return "steamvr"
+    if lowered.startswith("steam") or lowered in {"compat_log.txt", "gameprocess_log.txt"}:
+        return "steam"
+    if lowered.endswith((".pftrace", ".rgp")):
+        return "trace"
+    if lowered.endswith((".dmp", ".mdmp")):
+        return "dump"
+    return "other"
+
+
+def interesting(path, name):
+    if PATTERN:
+        lowered_path = path.lower()
+        lowered_name = name.lower()
+        lowered_pattern = PATTERN.lower()
+        return (
+            fnmatch.fnmatch(name, PATTERN)
+            or fnmatch.fnmatch(path, PATTERN)
+            or lowered_pattern in lowered_name
+            or lowered_pattern in lowered_path
+        )
+    lowered = name.lower()
+    return lowered.startswith(prefixes) or lowered.endswith(extensions)
+
+
+entries = []
+for root in roots:
+    if not os.path.exists(root):
+        continue
+    base_depth = root.rstrip(os.sep).count(os.sep)
+    for dirpath, dirnames, filenames in os.walk(root):
+        depth = dirpath.rstrip(os.sep).count(os.sep) - base_depth
+        if depth >= 3:
+            dirnames[:] = []
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            if not interesting(path, name):
+                continue
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            entries.append(
+                {
+                    "path": path,
+                    "name": name,
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                    "modified_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(stat.st_mtime)),
+                    "kind": kind_for(name),
+                }
+            )
+
+entries.sort(key=lambda item: item["mtime"], reverse=True)
+print(json.dumps({"entries": entries[:LIMIT], "roots": roots, "pattern": PATTERN, "limit": LIMIT}))
+""",
+        )
+        return {"device": to_jsonable(device), **data}
+
+    def steam_frame_perfcriteria(self, ref: DeviceRef) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        data = self._remote_python_json(
+            device,
+            r"""
+import json
+import os
+import re
+from pathlib import Path
+
+roots = [
+    Path(os.path.expanduser("~")) / ".local/share/Steam/logs",
+    Path(os.path.expanduser("~")) / ".local/share/Steam",
+    Path("/tmp"),
+]
+files = []
+for root in roots:
+    if not root.exists():
+        continue
+    try:
+        for path in root.rglob("perfcriteria.txt"):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            files.append({"path": str(path), "mtime": stat.st_mtime, "size": stat.st_size})
+    except OSError:
+        continue
+
+files.sort(key=lambda item: item["mtime"], reverse=True)
+latest = files[0] if files else None
+parsed = {}
+lines = []
+if latest:
+    try:
+        text = Path(latest["path"]).read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        parsed["error"] = str(exc)
+    else:
+        lines = text.splitlines()
+        parsed["summary"] = lines[:3]
+        frame_time_lines = [
+            line for line in lines if re.search(r"frame|ms|threshold|violation|resolution|fps", line, re.I)
+        ]
+        parsed["frame_time_lines"] = frame_time_lines[:120]
+
+print(json.dumps({"files": files[:20], "latest": latest, "parsed": parsed, "lines": lines[:200]}))
+""",
+        )
+        return {
+            "device": to_jsonable(device),
+            **data,
+            "notes": [
+                "Steam Frame docs describe perfcriteria.txt as the source for app/appid/target/"
+                "effective resolution and frame-time threshold violations.",
+                "Frame compatibility targets 72 fps at 1728x1728; below 1440x1440 is documented as Unsupported.",
+            ],
+        }
+
+    def steam_frame_cef_pages(self, ref: DeviceRef, ports: list[int] | None = None) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        selected_ports = ports or [8081, 8088]
+        if any(port < 1 or port > 65535 for port in selected_ports):
+            raise DevkitAdapterError("CEF ports must be between 1 and 65535")
+        data = self._remote_python_json(
+            device,
+            "PORTS = " + json.dumps(selected_ports) + r"""
+
+import json
+import subprocess
+import urllib.error
+import urllib.request
+
+
+def fetch_json(url):
+    try:
+        with urllib.request.urlopen(url, timeout=3) as response:
+            return json.loads(response.read().decode("utf-8", "replace")), None
+    except Exception as exc:
+        return None, str(exc)
+
+
+results = []
+for port in PORTS:
+    base = f"http://127.0.0.1:{port}"
+    version, version_error = fetch_json(base + "/json/version")
+    pages, pages_error = fetch_json(base + "/json/list")
+    if isinstance(pages, list):
+        pages = [
+            {
+                "id": item.get("id"),
+                "type": item.get("type"),
+                "title": item.get("title"),
+                "url": item.get("url"),
+                "devtoolsFrontendUrl": item.get("devtoolsFrontendUrl"),
+                "webSocketDebuggerUrl": item.get("webSocketDebuggerUrl"),
+            }
+            for item in pages
+        ]
+    results.append(
+        {
+            "port": port,
+            "version": version,
+            "version_error": version_error,
+            "pages": pages or [],
+            "pages_error": pages_error,
+        }
+    )
+
+print(json.dumps({"cef": results}))
+""",
+        )
+        for item in data.get("cef", []):
+            port = item.get("port")
+            if device.address and port:
+                item["url"] = f"http://{device.address}:{port}"
+        return {"device": to_jsonable(device), **data}
+
+    def steam_frame_web_ports(self, ref: DeviceRef) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        data = self._remote_python_json(
+            device,
+            r"""
+import json
+import re
+import subprocess
+import urllib.request
+
+ports = [32000, 8081, 8088, 27060, 5555, 5556]
+proc = subprocess.run(["ss", "-ltnp"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+listeners = []
+for line in proc.stdout.splitlines():
+    if not any(f":{port}" in line for port in ports):
+        continue
+    port = None
+    match = re.search(r":(\d+)\s+", line)
+    if match:
+        port = int(match.group(1))
+    listeners.append({"port": port, "line": line})
+
+devkit_properties = None
+devkit_error = None
+try:
+    with urllib.request.urlopen("http://127.0.0.1:32000/properties.json", timeout=3) as response:
+        devkit_properties = json.loads(response.read().decode("utf-8", "replace"))
+except Exception as exc:
+    devkit_error = str(exc)
+
+print(
+    json.dumps(
+        {
+            "listeners": listeners,
+            "ss_returncode": proc.returncode,
+            "ss_stderr": proc.stderr.strip(),
+            "devkit_properties": devkit_properties,
+            "devkit_error": devkit_error,
+        }
+    )
+)
+""",
+        )
+        if device.address:
+            for item in data.get("listeners", []):
+                port = item.get("port")
+                if port:
+                    item["url"] = f"http://{device.address}:{port}"
+        return {"device": to_jsonable(device), **data}
+
+    def steam_frame_dbus_manager(self, ref: DeviceRef) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        data = self._remote_python_json(
+            device,
+            r"""
+import json
+import re
+import subprocess
+
+SERVICE = "com.steampowered.SteamOSManager1"
+PATH = "/com/steampowered/SteamOSManager1"
+
+proc = subprocess.run(
+    ["busctl", "--user", "introspect", "--no-pager", SERVICE, PATH],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+    check=False,
+)
+interfaces = []
+current = None
+for line in proc.stdout.splitlines():
+    if line.startswith("NAME ") or not line.strip():
+        continue
+    parts = line.split(None, 4)
+    if len(parts) < 2:
+        continue
+    name, kind = parts[0], parts[1]
+    if kind == "interface":
+        current = {"name": name, "properties": [], "methods": [], "signals": []}
+        interfaces.append(current)
+        continue
+    if current is None:
+        continue
+    row = {"name": name.lstrip("."), "signature": parts[2] if len(parts) > 2 else "", "raw": line}
+    if kind == "property":
+        value_flags = parts[4] if len(parts) > 4 else ""
+        row["value"] = value_flags
+        row["writable"] = "writable" in value_flags
+        current["properties"].append(row)
+    elif kind == "method":
+        row["result"] = parts[3] if len(parts) > 3 else ""
+        current["methods"].append(row)
+    elif kind == "signal":
+        current["signals"].append(row)
+
+print(
+    json.dumps(
+        {
+            "service": SERVICE,
+            "path": PATH,
+            "returncode": proc.returncode,
+            "stderr": proc.stderr.strip(),
+            "interfaces": interfaces,
+            "raw_lines": proc.stdout.splitlines()[:400],
+            "notes": [
+                "Properties are read-only here even when DBus marks them writable.",
+                "Manager control methods and writable properties should be separate confirmation-gated tools.",
+            ],
+        }
+    )
+)
+""",
+        )
+        return {"device": to_jsonable(device), **data}
+
+    def native_adbd_status(self, ref: DeviceRef) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        data = self._remote_python_json(
+            device,
+            r"""
+import json
+import subprocess
+
+props = ["ActiveState", "SubState", "LoadState", "FragmentPath", "MainPID", "Environment"]
+proc = subprocess.run(
+    ["systemctl", "show", "adbd.service", "--no-pager"] + [f"-p{name}" for name in props],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+    check=False,
+)
+status = {}
+for line in proc.stdout.splitlines():
+    if "=" in line:
+        key, value = line.split("=", 1)
+        status[key] = value
+print(json.dumps({"unit": "adbd.service", "returncode": proc.returncode, "stderr": proc.stderr.strip(), "status": status}))
+""",
+        )
+        return {"device": to_jsonable(device), **data}
+
+    def coredump_list(self, ref: DeviceRef, limit: int = 20) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        bounded_limit = min(max(int(limit), 1), 100)
+        data = self._remote_python_json(
+            device,
+            "LIMIT = " + str(bounded_limit) + r"""
+
+import json
+import subprocess
+
+proc = subprocess.run(
+    ["coredumpctl", "--no-pager", "--no-legend", "list"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+    check=False,
+    timeout=20,
+)
+entries = []
+for line in proc.stdout.splitlines()[-LIMIT:]:
+    parts = line.split()
+    exe = parts[-2] if len(parts) >= 2 and parts[-1] == "-" else parts[-1] if parts else ""
+    entries.append({"line": line, "executable": exe})
+print(json.dumps({"entries": entries, "returncode": proc.returncode, "stderr": proc.stderr.strip(), "limit": LIMIT}))
+""",
+        )
+        return {
+            "device": to_jsonable(device),
+            **data,
+            "notes": [
+                "Use coredumpctl debug <PID> manually or through a future confirmation-gated tool for backtraces.",
+                "Some dumps may be inaccessible without elevated permissions.",
+            ],
+        }
+
+    def steam_services(
+        self,
+        ref: DeviceRef,
+        scope: str = "user",
+        pattern: str | None = None,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        normalized_scope = scope.lower()
+        if normalized_scope not in {"user", "system"}:
+            raise DevkitAdapterError("scope must be 'user' or 'system'")
+        bounded_limit = min(max(int(limit), 1), 500)
+        data = self._remote_python_json(
+            device,
+            "SCOPE = "
+            + json.dumps(normalized_scope)
+            + "\nPATTERN = "
+            + json.dumps(pattern or "")
+            + "\nLIMIT = "
+            + str(bounded_limit)
+            + r"""
+
+import json
+import subprocess
+
+args = ["systemctl"]
+if SCOPE == "user":
+    args.append("--user")
+args += ["list-units", "--type=service", "--all", "--no-pager", "--plain", "--no-legend"]
+proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+services = []
+for line in proc.stdout.splitlines():
+    parts = line.split(None, 4)
+    if len(parts) < 4:
+        continue
+    description = parts[4] if len(parts) > 4 else ""
+    haystack = line.lower()
+    if PATTERN and PATTERN.lower() not in haystack:
+        continue
+    services.append(
+        {
+            "unit": parts[0],
+            "load": parts[1],
+            "active": parts[2],
+            "sub": parts[3],
+            "description": description,
+        }
+    )
+    if len(services) >= LIMIT:
+        break
+
+print(
+    json.dumps(
+        {
+            "scope": SCOPE,
+            "pattern": PATTERN,
+            "services": services,
+            "stderr": proc.stderr.strip(),
+            "returncode": proc.returncode,
+        }
+    )
+)
+""",
+        )
+        return {"device": to_jsonable(device), **data}
+
+    def journalctl_tail(
+        self,
+        ref: DeviceRef,
+        unit: str,
+        lines: int = 200,
+        scope: str = "user",
+    ) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        normalized_scope = scope.lower()
+        if normalized_scope not in {"user", "system"}:
+            raise DevkitAdapterError("scope must be 'user' or 'system'")
+        if not SYSTEMD_UNIT_RE.fullmatch(unit):
+            raise DevkitAdapterError(f"Invalid systemd unit name: {unit}")
+        bounded_lines = min(max(int(lines), 1), 2000)
+        parts = ["journalctl"]
+        if normalized_scope == "user":
+            parts.append("--user")
+        parts += ["-u", unit, "-n", str(bounded_lines), "--no-pager", "-o", "short-iso"]
+        out, err, status = self.simple_ssh(
+            device,
+            " ".join(shlex.quote(part) for part in parts),
+            silent=True,
+        )
+        return {
+            "device": to_jsonable(device),
+            "scope": normalized_scope,
+            "unit": unit,
+            "exit_status": status,
+            "stderr": err,
+            "lines": out.splitlines(),
+        }
+
+    def steam_frame_dev_inventory(self, ref: DeviceRef) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        data = self._remote_python_json(
+            device,
+            r"""
+import json
+import os
+import re
+import subprocess
+from pathlib import Path
+
+
+def run(args, timeout=20):
+    try:
+        proc = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        return {"returncode": -1, "stdout": "", "stderr": str(exc)}
+    return {"returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
+
+
+def read_text(path, limit=20000):
+    try:
+        data = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return {"path": path, "error": str(exc)}
+    truncated = len(data) > limit
+    return {"path": path, "text": data[:limit], "truncated": truncated}
+
+
+def parse_services(scope):
+    args = ["systemctl"]
+    if scope == "user":
+        args.append("--user")
+    args += ["list-units", "--type=service", "--all", "--no-pager", "--plain", "--no-legend"]
+    proc = run(args)
+    needles = ("steam", "steamvr", "gamescope", "deckard", "lepton", "adb", "devkit", "pidbridge", "xrdp")
+    services = []
+    for line in proc["stdout"].splitlines():
+        if not any(needle in line.lower() for needle in needles):
+            continue
+        parts = line.split(None, 4)
+        if len(parts) >= 4:
+            services.append(
+                {
+                    "unit": parts[0],
+                    "load": parts[1],
+                    "active": parts[2],
+                    "sub": parts[3],
+                    "description": parts[4] if len(parts) > 4 else "",
+                }
+            )
+    return {"returncode": proc["returncode"], "stderr": proc["stderr"].strip(), "services": services}
+
+
+def bus_names(scope):
+    args = ["busctl"]
+    if scope == "user":
+        args.append("--user")
+    args += ["list", "--no-pager", "--no-legend"]
+    proc = run(args)
+    names = []
+    needles = ("steam", "gamescope", "deckard", "lepton", "vr", "pidbridge", "manager")
+    for line in proc["stdout"].splitlines():
+        if any(needle in line.lower() for needle in needles):
+            names.append(line)
+    return {"returncode": proc["returncode"], "stderr": proc["stderr"].strip(), "names": names[:120]}
+
+
+def script_summary(path):
+    summary = {"path": path, "exists": os.path.exists(path), "functions": [], "env_refs": []}
+    if not summary["exists"]:
+        return summary
+    try:
+        for lineno, line in enumerate(Path(path).read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            stripped = line.strip()
+            if re.match(r"^(function\s+)?[A-Za-z0-9_]+\(\)", stripped):
+                summary["functions"].append({"line": lineno, "text": stripped})
+            if re.search(r"\b(LEPTON_|ENABLE_|RENDERDOC_|SteamAppId|SteamGameId|ADB_|GDB_|LLDB_)", line):
+                summary["env_refs"].append({"line": lineno, "text": stripped[:220]})
+            if len(summary["functions"]) >= 80 and len(summary["env_refs"]) >= 80:
+                break
+    except OSError as exc:
+        summary["error"] = str(exc)
+    summary["functions"] = summary["functions"][:120]
+    summary["env_refs"] = summary["env_refs"][:120]
+    return summary
+
+
+def binary_summary(path):
+    summary = {"path": path, "exists": os.path.exists(path)}
+    if not summary["exists"]:
+        return summary
+    summary["file"] = run(["file", path])["stdout"].strip()
+    strings = run(["strings", "-a", path], timeout=30)
+    pattern = re.compile(
+        r"steam|steamos|lepton|deckard|adb|debug|trace|perf|capture|renderdoc|vulkan|"
+        r"openxr|gdb|lldb|dbus|busctl|service|journal|podman|container",
+        re.IGNORECASE,
+    )
+    matches = []
+    for line in strings["stdout"].splitlines():
+        if pattern.search(line):
+            matches.append(line[:240])
+        if len(matches) >= 120:
+            break
+    summary["strings_returncode"] = strings["returncode"]
+    summary["interesting_strings"] = matches
+    return summary
+
+
+home = os.path.expanduser("~")
+lepton_root = os.path.join(home, ".local/share/Steam/steamapps/common/Lepton")
+lepton_lib = os.path.join(lepton_root, "liblepton")
+script_names = [
+    "liblepton.sh",
+    "mounting.sh",
+    "networking.sh",
+    "properties.sh",
+    "perfetto.sh",
+    "renderdoc.sh",
+    "strace.sh",
+    "gdb.sh",
+    "vulkan_layers.sh",
+    "performance_debugging.sh",
+    "utils.sh",
+]
+binary_paths = [
+    "/usr/lib/steamos-manager",
+    "/usr/bin/pidbridge",
+    "/usr/bin/gamescope",
+    "/usr/bin/steam",
+    os.path.join(lepton_lib, "apk_extractor/bin/apk-info-extractor"),
+]
+tool_names = [
+    "podman",
+    "gamescope",
+    "steam",
+    "busctl",
+    "journalctl",
+    "coredumpctl",
+    "perfetto",
+    "renderdoccmd",
+    "strace",
+    "gdbserver",
+    "lldb-server",
+]
+
+lepton_help = run([os.path.join(lepton_root, "lepton"), "help"]) if os.path.exists(os.path.join(lepton_root, "lepton")) else {"returncode": 127, "stdout": "", "stderr": "Lepton CLI not found"}
+devkit_utils = []
+devkit_dir = Path(home) / "devkit-utils"
+if devkit_dir.exists():
+    devkit_utils = sorted(path.name for path in devkit_dir.iterdir() if path.is_file())
+
+print(
+    json.dumps(
+        {
+            "os_release": read_text("/etc/os-release"),
+            "uname": run(["uname", "-a"])["stdout"].strip(),
+            "tool_paths": {name: run(["sh", "-lc", f"command -v {name} || true"])["stdout"].strip() for name in tool_names},
+            "devkit_utils": devkit_utils,
+            "lepton_root": lepton_root,
+            "lepton_help": {
+                "returncode": lepton_help["returncode"],
+                "stdout": lepton_help["stdout"][:12000],
+                "stderr": lepton_help["stderr"],
+            },
+            "lepton_scripts": [script_summary(os.path.join(lepton_lib, name)) for name in script_names],
+            "services": {"user": parse_services("user"), "system": parse_services("system")},
+            "dbus": {"user": bus_names("user"), "system": bus_names("system")},
+            "binary_candidates": [binary_summary(path) for path in binary_paths],
+            "notes": [
+                "This inventory is static/read-only and intentionally bounded to known Steam Frame dev surfaces.",
+                "Use binary_candidates interesting strings to decide which files deserve local IDA/Ghidra decompilation.",
+            ],
+        }
+    )
+)
+""",
+        )
+        return {"device": to_jsonable(device), **data}
+
     def screenshot(
         self,
         ref: DeviceRef,
@@ -850,6 +1643,13 @@ class SteamOSDevkitAdapter:
         filter_args: list[str] | None = None,
         clear_first: bool = False,
     ) -> dict[str, Any]:
+        if filter_args and not clear_first:
+            unsafe = [arg for arg in filter_args if arg.startswith("-")]
+            if unsafe:
+                raise DevkitAdapterError(
+                    "Read-only adb_logcat only accepts filterspec tokens. "
+                    f"Use clear_first=True with confirmation for logcat options: {unsafe}"
+                )
         if clear_first:
             self._run_adb(self._adb_serial_args(serial) + ["logcat", "-c"], timeout=20)
         args = self._adb_serial_args(serial) + ["logcat", "-d", "-t", str(max(1, int(lines)))]
@@ -926,10 +1726,17 @@ class SteamOSDevkitAdapter:
         command: str,
         silent: bool = False,
         check_status: bool = False,
+        timeout: float | None = None,
     ) -> tuple[str, str, int]:
         ssh = self._open_ssh(device)
         try:
-            return self._simple_ssh_client(ssh, command, silent=silent, check_status=check_status)
+            return self._simple_ssh_client(
+                ssh,
+                command,
+                silent=silent,
+                check_status=check_status,
+                timeout=timeout,
+            )
         finally:
             ssh.close()
 
@@ -1016,13 +1823,31 @@ class SteamOSDevkitAdapter:
         key = paramiko.RSAKey.from_private_key_file(key_info["key_path"])
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(
-            device.address,
-            username=device.login,
-            pkey=key,
-            timeout=REQUEST_TIMEOUT,
-            look_for_keys=False,
-        )
+        try:
+            ssh.connect(
+                device.address,
+                username=device.login,
+                pkey=key,
+                timeout=REQUEST_TIMEOUT,
+                look_for_keys=False,
+            )
+        except paramiko.AuthenticationException:
+            password = os.environ.get("STEAMOS_DEVKIT_SSH_PASSWORD") or os.environ.get(
+                "STEAMOS_DEVKIT_PASSWORD"
+            )
+            if not password:
+                raise
+            ssh.close()
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(
+                device.address,
+                username=device.login,
+                password=password,
+                timeout=REQUEST_TIMEOUT,
+                look_for_keys=False,
+                allow_agent=False,
+            )
         return ssh
 
     def _run_adb(self, args: list[str], timeout: int) -> dict[str, Any]:
@@ -1074,12 +1899,18 @@ class SteamOSDevkitAdapter:
         command: str,
         silent: bool = False,
         check_status: bool = False,
+        timeout: float | None = None,
     ) -> tuple[str, str, int]:
         del silent
-        _, stdout, stderr = ssh.exec_command(command)
-        status = stdout.channel.recv_exit_status()
-        out = stdout.read().decode("utf-8", "replace")
-        err = stderr.read().decode("utf-8", "replace")
+        _, stdout, stderr = ssh.exec_command(command, timeout=timeout)
+        try:
+            status = stdout.channel.recv_exit_status()
+            out = stdout.read().decode("utf-8", "replace")
+            err = stderr.read().decode("utf-8", "replace")
+        except TimeoutError as exc:
+            raise DevkitAdapterError(f"SSH command timed out after {timeout} seconds: {command}") from exc
+        except socket.timeout as exc:
+            raise DevkitAdapterError(f"SSH command timed out after {timeout} seconds: {command}") from exc
         if check_status and status != 0:
             raise DevkitAdapterError(err or out or f"command failed: {command}")
         return out, err, status
@@ -1087,6 +1918,29 @@ class SteamOSDevkitAdapter:
     def _ssh_checked(self, ssh: paramiko.SSHClient, command: str) -> str:
         out, _, _ = self._simple_ssh_client(ssh, command, silent=True, check_status=True)
         return out
+
+    def _remote_python_json(
+        self,
+        device: DeviceInfo,
+        script: str,
+        timeout_seconds: int = 60,
+    ) -> dict[str, Any]:
+        command = f"timeout {int(timeout_seconds)}s python3 - <<'PY'\n" + script.strip() + "\nPY"
+        out, err, status = self.simple_ssh(
+            device,
+            command,
+            silent=True,
+            timeout=timeout_seconds + 10,
+        )
+        if status != 0:
+            raise DevkitAdapterError(err or out or "remote python command failed")
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError as exc:
+            raise DevkitAdapterError(f"Could not parse remote JSON output: {out!r}") from exc
+        if not isinstance(data, dict):
+            raise DevkitAdapterError(f"Remote JSON output was not an object: {out!r}")
+        return data
 
     def _discover_mdns(self, timeout_seconds: float) -> list[DeviceInfo]:
         try:

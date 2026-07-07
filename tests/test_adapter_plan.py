@@ -4,9 +4,11 @@ from pathlib import Path
 
 from typing import Any
 
-from mcp_steamos_devkit.adapter import SteamOSDevkitAdapter, _parse_adb_devices
+import pytest
+
+from mcp_steamos_devkit.adapter import DevkitAdapterError, SteamOSDevkitAdapter, _parse_adb_devices
 from mcp_steamos_devkit.config import DevkitLayout
-from mcp_steamos_devkit.models import DeviceRef, UploadProfile
+from mcp_steamos_devkit.models import DeviceInfo, DeviceRef, UploadProfile
 from mcp_steamos_devkit.state import JsonStore
 
 
@@ -121,6 +123,9 @@ def test_adb_install_and_logcat_commands(tmp_path: Path, monkeypatch) -> None:
     assert calls[-2] == (["-s", "frame:5555", "logcat", "-c"], 20)
     assert calls[-1] == (["-s", "frame:5555", "logcat", "-d", "-t", "50", "UE", "*:S"], 60)
 
+    with pytest.raises(DevkitAdapterError):
+        adapter.adb_logcat(serial="frame:5555", filter_args=["-c"], clear_first=False)
+
 
 def test_validate_android_split_package_detects_unity_export_obb(
     tmp_path: Path, monkeypatch
@@ -215,3 +220,154 @@ def test_adb_lepton_app_diagnostics_builds_fixed_commands(tmp_path: Path, monkey
         "XR_SESSION_STATE_READY->XR_SESSION_STATE_SYNCHRONIZED",
         "I/Unity: Result: k_ESteamAPIInitResult_OK, msg=",
     ]
+
+
+def test_lepton_containers_adds_adb_targets(tmp_path: Path, monkeypatch) -> None:
+    adapter = make_adapter(tmp_path)
+    device = DeviceInfo(id="frame", name="frame", address="192.168.50.128", login="steamos")
+
+    monkeypatch.setattr(adapter, "resolve_device", lambda ref: device)
+    monkeypatch.setattr(
+        adapter,
+        "_remote_python_json",
+        lambda resolved, script: {
+            "containers": [
+                {
+                    "name": "lepton-steamlaunch-3570175983",
+                    "context": "steamlaunch-3570175983",
+                    "ports": {"adb": "5556", "gdb": "1338", "lldb": "2338"},
+                    "labels": {"adb_port": "5556"},
+                }
+            ]
+        },
+    )
+
+    result = adapter.lepton_containers(DeviceRef("frame"))
+
+    assert result["device"]["address"] == "192.168.50.128"
+    assert result["containers"][0]["adb_target"] == "192.168.50.128:5556"
+
+
+def test_lepton_logcat_bounds_and_validates_context(tmp_path: Path, monkeypatch) -> None:
+    adapter = make_adapter(tmp_path)
+    device = DeviceInfo(id="frame", name="frame", address="frame", login="steamos")
+    calls: list[str] = []
+
+    monkeypatch.setattr(adapter, "resolve_device", lambda ref: device)
+
+    def fake_simple_ssh(
+        resolved: DeviceInfo,
+        command: str,
+        silent: bool = False,
+        check_status: bool = False,
+    ) -> tuple[str, str, int]:
+        del resolved, silent, check_status
+        calls.append(command)
+        return "I/Unity: SteamAPI_Init OK\nE/Unity: XR_ERROR_RUNTIME_FAILURE\n", "", 0
+
+    monkeypatch.setattr(adapter, "simple_ssh", fake_simple_ssh)
+
+    result = adapter.lepton_logcat(DeviceRef("frame"), "steamlaunch-3570175983", lines=99999)
+
+    assert "logcat steamlaunch-3570175983" in calls[0]
+    assert "tail -n 5000" in calls[0]
+    assert result["highlight_lines"] == [
+        "I/Unity: SteamAPI_Init OK",
+        "E/Unity: XR_ERROR_RUNTIME_FAILURE",
+    ]
+
+    with pytest.raises(DevkitAdapterError):
+        adapter.lepton_logcat(DeviceRef("frame"), "bad;context")
+
+
+def test_steam_logs_manifest_bounds_limit_and_passes_pattern(tmp_path: Path, monkeypatch) -> None:
+    adapter = make_adapter(tmp_path)
+    device = DeviceInfo(id="frame", name="frame", address="frame", login="steamos")
+    scripts: list[str] = []
+
+    monkeypatch.setattr(adapter, "resolve_device", lambda ref: device)
+
+    def fake_remote_python_json(resolved: DeviceInfo, script: str) -> dict[str, Any]:
+        scripts.append(script)
+        return {"entries": [], "roots": ["/home/steamos/.local/share/Steam/logs"], "limit": 500}
+
+    monkeypatch.setattr(adapter, "_remote_python_json", fake_remote_python_json)
+
+    result = adapter.steam_logs_manifest(DeviceRef("frame"), pattern="xrclient", limit=999)
+
+    assert result["limit"] == 500
+    assert 'PATTERN = "xrclient"' in scripts[0]
+    assert "LIMIT = 500" in scripts[0]
+
+
+def test_steam_frame_perfcriteria_parses_remote_json(tmp_path: Path, monkeypatch) -> None:
+    adapter = make_adapter(tmp_path)
+    device = DeviceInfo(id="frame", name="frame", address="frame", login="steamos")
+
+    monkeypatch.setattr(adapter, "resolve_device", lambda ref: device)
+    monkeypatch.setattr(
+        adapter,
+        "_remote_python_json",
+        lambda resolved, script: {
+            "latest": {"path": "/home/steamos/.local/share/Steam/logs/perfcriteria.txt"},
+            "parsed": {"summary": ["app line", "target line", "frame time line"]},
+            "lines": ["app line", "target line", "frame time line"],
+            "files": [],
+        },
+    )
+
+    result = adapter.steam_frame_perfcriteria(DeviceRef("frame"))
+
+    assert result["latest"]["path"].endswith("perfcriteria.txt")
+    assert "72 fps" in result["notes"][1]
+
+
+def test_journalctl_tail_quotes_valid_unit_and_rejects_invalid(tmp_path: Path, monkeypatch) -> None:
+    adapter = make_adapter(tmp_path)
+    device = DeviceInfo(id="frame", name="frame", address="frame", login="steamos")
+    calls: list[str] = []
+
+    monkeypatch.setattr(adapter, "resolve_device", lambda ref: device)
+
+    def fake_simple_ssh(
+        resolved: DeviceInfo,
+        command: str,
+        silent: bool = False,
+        check_status: bool = False,
+    ) -> tuple[str, str, int]:
+        del resolved, silent, check_status
+        calls.append(command)
+        return "line one\nline two\n", "", 0
+
+    monkeypatch.setattr(adapter, "simple_ssh", fake_simple_ssh)
+
+    result = adapter.journalctl_tail(DeviceRef("frame"), "steamvr.service", lines=5)
+
+    assert calls == ["journalctl --user -u steamvr.service -n 5 --no-pager -o short-iso"]
+    assert result["lines"] == ["line one", "line two"]
+
+    with pytest.raises(DevkitAdapterError):
+        adapter.journalctl_tail(DeviceRef("frame"), "steamvr.service; rm -rf /")
+
+
+def test_steam_frame_dev_inventory_is_read_only_bounded_script(tmp_path: Path, monkeypatch) -> None:
+    adapter = make_adapter(tmp_path)
+    device = DeviceInfo(id="frame", name="frame", address="frame", login="steamos")
+    scripts: list[str] = []
+
+    monkeypatch.setattr(adapter, "resolve_device", lambda ref: device)
+
+    def fake_remote_python_json(resolved: DeviceInfo, script: str) -> dict[str, Any]:
+        del resolved
+        scripts.append(script)
+        return {"lepton_help": {"stdout": "Usage: lepton verb"}, "binary_candidates": []}
+
+    monkeypatch.setattr(adapter, "_remote_python_json", fake_remote_python_json)
+
+    result = adapter.steam_frame_dev_inventory(DeviceRef("frame"))
+
+    assert result["device"]["name"] == "frame"
+    assert result["lepton_help"]["stdout"] == "Usage: lepton verb"
+    assert "binary_summary" in scripts[0]
+    assert "systemctl" in scripts[0]
+    assert "busctl" in scripts[0]

@@ -16,6 +16,7 @@ The server is built for Windows-first SteamOS Devkit installs, but the core adap
 - Title launch through `steam-devkit-rpc run-game`
 - Steam client/session controls
 - Logs, controller config dumps, screenshots, GPU traces, RGP captures, RenderDoc replay server control
+- Steam Frame native diagnostics: Lepton container/debug-port inventory, Steam/SteamVR/OpenXR log manifests, systemd service listing, journal tails, and bounded OS/Lepton/static-binary inventory for MCP tool discovery
 - Steam Frame Lepton ADB helpers: device listing, Wi-Fi/USB connect, forward/reverse, APK install, shell, logcat, bugreport, and Unreal Insights setup
 - Steam Frame Unity split APK/OBB helpers: APK package inspection, OBB layout validation/staging, and focused launch diagnostics
 - Safety confirmation tokens for destructive or arbitrary remote operations
@@ -45,6 +46,12 @@ Optional ADB path for Steam Frame Lepton/Android work:
 
 ```powershell
 $env:ADB_PATH = 'C:\Users\ellio\AppData\Local\Android\Sdk\platform-tools\adb.exe'
+```
+
+Optional SSH password fallback if the device has not accepted the devkit SSH key:
+
+```powershell
+$env:STEAMOS_DEVKIT_SSH_PASSWORD = 'your-device-password'
 ```
 
 Optional Android build-tools path for APK metadata inspection:
@@ -82,6 +89,35 @@ adb_lepton_app_diagnostics(package_name="com.example.game", serial="frame:5556")
 ```
 
 `adb_shell` is intentionally confirmation-gated because it can run arbitrary commands inside the Android container.
+
+## Steam Frame Native Diagnostics
+
+These read-only tools inspect the native SteamOS side of Steam Frame:
+
+```text
+lepton_containers(target="frame")
+lepton_logcat(target="frame", context="steamlaunch-3570175983", lines=300)
+steam_logs_manifest(target="frame", pattern="xrclient", limit=20)
+steam_frame_perfcriteria(target="frame")
+steam_frame_cef_pages(target="frame")
+steam_frame_web_ports(target="frame")
+steam_frame_dbus_manager(target="frame")
+native_adbd_status(target="frame")
+coredump_list(target="frame", limit=20)
+steam_services(target="frame", scope="user", pattern="steamvr")
+journalctl_tail(target="frame", unit="steamvr.service", scope="user", lines=200)
+steam_frame_dev_inventory(target="frame")
+```
+
+`steam_frame_dev_inventory` is a bounded discovery pass for future MCP controls. It collects OS build
+metadata, Lepton CLI help, Lepton script functions/env references, relevant system/user services,
+DBus names, and static strings from known Steam Frame helper binaries. It does not kill, restart,
+trace, or mutate Steam/Lepton state.
+
+DBus control methods, Lepton debug-server lifecycle, RenderDoc/Vulkan layer injection, tracking
+dataset packaging, Mesa debug package installation, and coredump debugger backtraces should be
+implemented as separate confirmation-gated tools because they start capture/debug flows, alter
+runtime state, or may expose private data.
 
 ## Steam Frame Unity APK + OBB
 
@@ -137,6 +173,7 @@ The server treats these operations as confirmation-gated:
 
 - Pairing/registering a device
 - Clean uploads that delete remote files
+- Local artifact writes such as log syncs and ADB bugreports
 - Deleting titles or all titles
 - Resetting Steam client state
 - Restarting sessions or rebooting
