@@ -21,7 +21,7 @@ def test_validate_upload_plan_counts_files_and_flags_destructive(tmp_path: Path)
     source = tmp_path / "game"
     source.mkdir()
     (source / "a.txt").write_text("abc", encoding="utf-8")
-    (source / "b.bin").write_bytes(b"12345")
+    (source / "b.bin").write_bytes(b"abcde")
 
     adapter = make_adapter(tmp_path)
     plan = adapter.validate_upload_plan(
@@ -191,6 +191,44 @@ def test_stage_android_obb_layout_copies_expected_name(tmp_path: Path, monkeypat
 
     second = adapter.stage_android_obb_layout(str(source))
     assert not second["copied"]
+
+
+def test_steampipe_android_release_preflight_checks_layout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "game"
+    source.mkdir()
+    apk = source / "game.apk"
+    apk.write_bytes(b"fake apk")
+    (source / "game.main.obb").write_bytes(b"root obb")
+    obb_dir = source / "obb"
+    obb_dir.mkdir()
+    (obb_dir / "content_001.obb").write_bytes(b"content")
+    adapter = make_adapter(tmp_path)
+
+    monkeypatch.setattr(
+        adapter,
+        "inspect_android_apk",
+        lambda apk_path: {
+            "apk_path": apk_path,
+            "package_name": "com.example.game",
+            "version_code": "42",
+            "expected_main_obb": "main.42.com.example.game.obb",
+        },
+    )
+
+    result = adapter.steampipe_android_release_preflight(
+        str(source),
+        app_id="555000",
+        depot_id="555001",
+        cloud_subdirectory="com.example.game",
+    )
+
+    assert result["ok"]
+    assert result["launch_executable"] == "game.apk"
+    assert "Root-level OBB files were found" in result["warnings"][0]
+    assert result["checklist"][2]["status"] == "ok"
+    assert result["checklist"][-1]["status"] == "ok"
 
 
 def test_adb_lepton_app_diagnostics_builds_fixed_commands(tmp_path: Path, monkeypatch) -> None:
@@ -455,3 +493,138 @@ def test_steam_frame_manager_interfaces_uses_plural_property_bucket(
 
     assert '"property": "properties"' in scripts[0]
     assert 'KIND_BUCKETS[kind]' in scripts[0]
+
+
+def test_second_pass_status_tools_build_expected_remote_scripts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    adapter = make_adapter(tmp_path)
+    device = DeviceInfo(id="frame", name="frame", address="frame", login="steamos")
+    scripts: list[str] = []
+
+    monkeypatch.setattr(adapter, "resolve_device", lambda ref: device)
+
+    def fake_remote_python_json(resolved: DeviceInfo, script: str) -> dict[str, Any]:
+        del resolved
+        scripts.append(script)
+        if "native_user_active_runtime" in script:
+            return {"paths": {}}
+        if "ENABLE_VULKAN_RENDERDOC_CAPTURE" in script:
+            return {"helpers": {}, "vulkan_layers": {}, "files": {}, "env_flags": {}}
+        if "patterns = [" in script:
+            return {"context": "dev", "package_name": "com.example.game", "entries": []}
+        return {"root": "/home/steamos/.config/openvr/config/cv/xrservice/datasets", "datasets": []}
+
+    monkeypatch.setattr(adapter, "_remote_python_json", fake_remote_python_json)
+
+    adapter.steam_frame_openxr_status(DeviceRef("frame"))
+    adapter.lepton_graphics_debug_status(DeviceRef("frame"))
+    adapter.lepton_artifacts_manifest(DeviceRef("frame"), "dev", "com.example.game", limit=999)
+    adapter.steam_frame_tracking_datasets(DeviceRef("frame"), limit=999)
+
+    assert "native_user_active_runtime" in scripts[0]
+    assert "lepton_overlay_active_runtime" in scripts[0]
+    assert "ENABLE_VULKAN_RENDERDOC_CAPTURE" in scripts[1]
+    assert "mesa_version" in scripts[1]
+    assert 'CONTEXT = "dev"' in scripts[2]
+    assert 'PACKAGE_NAME = "com.example.game"' in scripts[2]
+    assert "LIMIT = 500" in scripts[2]
+    assert "xrservice/datasets" in scripts[3]
+    assert "LIMIT = 100" in scripts[3]
+
+    with pytest.raises(DevkitAdapterError):
+        adapter.lepton_artifacts_manifest(DeviceRef("frame"), "dev", "not a package")
+
+
+def test_adb_environment_conflict_doctor_reports_conflicts(tmp_path: Path, monkeypatch) -> None:
+    adapter = make_adapter(tmp_path)
+    adb_one = tmp_path / "sdk1" / "adb.exe"
+    adb_two = tmp_path / "sdk2" / "adb.exe"
+    adb_one.parent.mkdir()
+    adb_two.parent.mkdir()
+    adb_one.write_text("fake", encoding="utf-8")
+    adb_two.write_text("fake", encoding="utf-8")
+
+    monkeypatch.setenv("ADB_PATH", str(adb_one))
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setattr(adapter.layout, "locate_adb", lambda: str(adb_two))
+    monkeypatch.setattr(
+        "socket.getaddrinfo",
+        lambda *args, **kwargs: [(None, None, None, None, ("192.0.2.10", 5555))],
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_run_adb",
+        lambda args, timeout: {
+            "args": args,
+            "timeout": timeout,
+            "returncode": 0,
+            "stdout": "List of devices attached\nframe:5555\tdevice\nother:5555\tdevice\n",
+            "stderr": "",
+        },
+    )
+
+    def fake_run(cmd, **kwargs):
+        del kwargs
+        if cmd[0] in {str(adb_one), str(adb_two)}:
+            return type(
+                "Proc",
+                (),
+                {"returncode": 0, "stdout": f"Android Debug Bridge version {cmd[0]}\n", "stderr": ""},
+            )()
+        return type("Proc", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    result = adapter.adb_environment_conflict_doctor("frame")
+
+    assert not result["ok"]
+    assert len(result["candidates"]) == 2
+    assert result["dns"]["addresses"] == ["192.0.2.10"]
+    assert any("Multiple adb executables" in note for note in result["notes"])
+    assert any("Multiple TCP ADB targets" in note for note in result["notes"])
+
+
+def test_sync_tracking_dataset_downloads_latest_dataset(tmp_path: Path, monkeypatch) -> None:
+    adapter = make_adapter(tmp_path)
+    device = DeviceInfo(id="frame", name="frame", address="frame", login="steamos")
+    transfers: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(adapter, "resolve_device", lambda ref: device)
+    monkeypatch.setattr(
+        adapter,
+        "steam_frame_tracking_datasets",
+        lambda ref, limit=100: {
+            "root": "/home/steamos/.config/openvr/config/cv/xrservice/datasets",
+            "datasets": [
+                {
+                    "name": "dataset-new",
+                    "path": "/home/steamos/.config/openvr/config/cv/xrservice/datasets/dataset-new",
+                }
+            ],
+        },
+    )
+
+    def fake_rsync_transfer(
+        localdir: str,
+        resolved: DeviceInfo,
+        remotedir: str | list[str],
+        upload: bool,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del resolved, kwargs
+        transfers.append((localdir, str(remotedir)))
+        assert not upload
+        return {"returncode": 0}
+
+    monkeypatch.setattr(adapter, "rsync_transfer", fake_rsync_transfer)
+
+    result = adapter.sync_tracking_dataset(DeviceRef("frame"), str(tmp_path / "datasets"))
+
+    assert result["dataset"]["name"] == "dataset-new"
+    assert transfers == [
+        (
+            str(tmp_path / "datasets"),
+            "/home/steamos/.config/openvr/config/cv/xrservice/datasets/dataset-new",
+        )
+    ]

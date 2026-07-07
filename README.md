@@ -69,6 +69,7 @@ Steam's bundled docs describe ADB as targeting the Lepton Android container on S
 Wi-Fi flow:
 
 ```text
+adb_environment_conflict_doctor(host="frame")
 adb_connect_lepton_wifi(host="frame", port=5555)
 adb_devices()
 adb_logcat(serial="frame:5555")
@@ -105,6 +106,7 @@ lepton_mounts(target="frame", context="dev", category="obb")
 lepton_apk_info(target="frame", apk_path="~/devkit-game/mygame/game.apk")
 lepton_rootfs_overlay_manifest(target="frame")
 lepton_debug_plan(target="frame", context="dev", mode="gdb")
+lepton_artifacts_manifest(target="frame", context="dev", package_name="com.example.game")
 steam_logs_manifest(target="frame", pattern="xrclient", limit=20)
 steam_frame_perfcriteria(target="frame")
 steam_frame_cef_pages(target="frame")
@@ -112,6 +114,10 @@ steam_frame_web_ports(target="frame")
 steam_frame_dbus_manager(target="frame")
 steam_frame_manager_properties(target="frame", bus="both")
 steam_frame_manager_interfaces(target="frame", include_system=true)
+steam_frame_openxr_status(target="frame")
+lepton_graphics_debug_status(target="frame")
+steam_frame_tracking_datasets(target="frame")
+sync_tracking_dataset(target="frame", output_folder="C:\path\to\datasets")
 deckard_power_status(target="frame")
 pidbridge_status(target="frame")
 deckard_runtime_environment(target="frame")
@@ -132,6 +138,11 @@ Lepton scripts, DBus introspection, and static binary strings. They are intentio
 they expose container labels, debug-port targets, rootfs overlay files, Deckard runtime files,
 power state, pidbridge service/socket state, and DBus method/property inventories without starting
 debug sessions or changing SteamOS Manager state.
+
+The second-pass tools line up with Valve's Steam Frame docs for OpenXR runtime setup, RenderDoc and
+Vulkan-layer launch debugging, perfetto/strace artifact handling, and tracking dataset collection.
+They report existing state by default; `sync_tracking_dataset` is a local artifact download helper
+for datasets recorded through the headset's SteamVR Developer settings.
 
 DBus control methods, Lepton debug-server lifecycle, RenderDoc/Vulkan layer injection, tracking
 dataset packaging, Mesa debug package installation, and coredump debugger backtraces should be
@@ -161,6 +172,7 @@ Useful flow:
 inspect_android_apk(apk_path="C:\path\build\game.apk")
 validate_android_split_package(local_dir="C:\path\build")
 stage_android_obb_layout(local_dir="C:\path\build")
+steampipe_android_release_preflight(local_dir="C:\path\build", app_id="555000", depot_id="555001")
 upload_title(target="frame", gameid="mygame", local_dir="C:\path\build", runtime="android")
 run_title(target="frame", gameid="mygame")
 adb_lepton_app_diagnostics(package_name="com.example.game", serial="frame:5556")
@@ -169,6 +181,10 @@ adb_lepton_app_diagnostics(package_name="com.example.game", serial="frame:5556")
 The diagnostics helper reports the app PID/activity state, the OBB symlink target,
 `SteamAppId`/`SteamGameId` process environment, and logcat highlights for OpenXR,
 Steamworks, TMP, exceptions, and common Unity XR failure strings.
+
+`steampipe_android_release_preflight` is a local read-only checklist for Valve's Android upload
+requirements: supported OS, Android depot OS, top-level APK launch executable, `obb/` content
+layout, package access, Android launch option, and AndroidExternalData cloud-save setup.
 
 ## MCP Client Config
 

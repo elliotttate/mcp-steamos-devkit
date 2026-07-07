@@ -62,10 +62,12 @@ def create_server() -> FastMCP:
                 "get_steamos_status",
                 "list_titles",
                 "adb_doctor",
+                "adb_environment_conflict_doctor",
                 "adb_devices",
                 "adb_logcat without clear_first",
                 "inspect_android_apk",
                 "validate_android_split_package",
+                "steampipe_android_release_preflight",
                 "adb_lepton_app_diagnostics",
                 "lepton_cli_help",
                 "lepton_containers",
@@ -76,6 +78,7 @@ def create_server() -> FastMCP:
                 "lepton_apk_info",
                 "lepton_rootfs_overlay_manifest",
                 "lepton_debug_plan",
+                "lepton_artifacts_manifest",
                 "steam_logs_manifest",
                 "steam_frame_perfcriteria",
                 "steam_frame_cef_pages",
@@ -83,6 +86,9 @@ def create_server() -> FastMCP:
                 "steam_frame_dbus_manager",
                 "steam_frame_manager_properties",
                 "steam_frame_manager_interfaces",
+                "steam_frame_openxr_status",
+                "lepton_graphics_debug_status",
+                "steam_frame_tracking_datasets",
                 "deckard_power_status",
                 "pidbridge_status",
                 "deckard_runtime_environment",
@@ -102,6 +108,7 @@ def create_server() -> FastMCP:
                 "adb_bugreport",
                 "adb_unreal_insights_setup",
                 "stage_android_obb_layout",
+                "sync_tracking_dataset",
             ],
             "destructive": [
                 "register_device",
@@ -166,6 +173,7 @@ def create_server() -> FastMCP:
                 "lepton_apk_info",
                 "lepton_rootfs_overlay_manifest",
                 "lepton_debug_plan",
+                "lepton_artifacts_manifest",
                 "steam_logs_manifest",
                 "steam_frame_perfcriteria",
                 "steam_frame_cef_pages",
@@ -173,6 +181,9 @@ def create_server() -> FastMCP:
                 "steam_frame_dbus_manager",
                 "steam_frame_manager_properties",
                 "steam_frame_manager_interfaces",
+                "steam_frame_openxr_status",
+                "lepton_graphics_debug_status",
+                "steam_frame_tracking_datasets",
                 "deckard_power_status",
                 "pidbridge_status",
                 "deckard_runtime_environment",
@@ -207,6 +218,7 @@ def create_server() -> FastMCP:
                 "RenderDoc/Vulkan validation/FDM/strace launch toggles",
                 "SteamOS Manager DBus controls discovered from introspection/decompile",
                 "Deckard runtime/state writes such as charger power_event",
+                "Tracking dataset capture start/stop and packaging",
             ],
         }
 
@@ -219,6 +231,16 @@ def create_server() -> FastMCP:
     def adb_doctor() -> dict[str, Any]:
         """Inspect local ADB availability and print Steam Frame Lepton connection notes."""
         return _run_tool(operations, "adb_doctor", SafetyLevel.READ_ONLY, adapter.adb_doctor)
+
+    @mcp.tool()
+    def adb_environment_conflict_doctor(host: str = "frame") -> dict[str, Any]:
+        """Find local ADB version/path conflicts, current devices, and Steam Frame hostname resolution."""
+        return _run_tool(
+            operations,
+            "adb_environment_conflict_doctor",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.adb_environment_conflict_doctor(host),
+        )
 
     @mcp.tool()
     def discover_devices(timeout_seconds: float = 5, include_cached: bool = True) -> dict[str, Any]:
@@ -394,6 +416,30 @@ def create_server() -> FastMCP:
             "stage_android_obb_layout",
             SafetyLevel.WRITE,
             lambda: adapter.stage_android_obb_layout(local_dir, apk_name, source_obb, overwrite),
+        )
+
+    @mcp.tool()
+    def steampipe_android_release_preflight(
+        local_dir: str,
+        apk_name: str | None = None,
+        app_id: str | None = None,
+        depot_id: str | None = None,
+        launch_executable: str | None = None,
+        cloud_subdirectory: str | None = None,
+    ) -> dict[str, Any]:
+        """Check a local Android depot folder against Steam Frame SteamPipe release requirements."""
+        return _run_tool(
+            operations,
+            "steampipe_android_release_preflight",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.steampipe_android_release_preflight(
+                local_dir,
+                apk_name,
+                app_id,
+                depot_id,
+                launch_executable,
+                cloud_subdirectory,
+            ),
         )
 
     @mcp.tool()
@@ -836,6 +882,25 @@ def create_server() -> FastMCP:
         )
 
     @mcp.tool()
+    def lepton_artifacts_manifest(
+        target: str,
+        context: str = "dev",
+        package_name: str | None = None,
+        limit: int = 100,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """List Lepton perfetto/strace/debug artifacts that already exist on the device."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "lepton_artifacts_manifest",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.lepton_artifacts_manifest(ref, context, package_name, limit),
+        )
+
+    @mcp.tool()
     def steam_logs_manifest(
         target: str,
         pattern: str | None = None,
@@ -951,6 +1016,73 @@ def create_server() -> FastMCP:
             "steam_frame_manager_interfaces",
             SafetyLevel.READ_ONLY,
             lambda: adapter.steam_frame_manager_interfaces(ref, include_system),
+        )
+
+    @mcp.tool()
+    def steam_frame_openxr_status(
+        target: str,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Inspect native and Lepton OpenXR active-runtime configuration files."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "steam_frame_openxr_status",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.steam_frame_openxr_status(ref),
+        )
+
+    @mcp.tool()
+    def lepton_graphics_debug_status(
+        target: str,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Inspect Lepton graphics debug helper scripts, Vulkan layers, RenderDoc, perfetto, and Mesa version."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "lepton_graphics_debug_status",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.lepton_graphics_debug_status(ref),
+        )
+
+    @mcp.tool()
+    def steam_frame_tracking_datasets(
+        target: str,
+        limit: int = 10,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """List SteamVR tracking datasets recorded from Steam Frame Developer settings."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "steam_frame_tracking_datasets",
+            SafetyLevel.READ_ONLY,
+            lambda: adapter.steam_frame_tracking_datasets(ref, limit),
+        )
+
+    @mcp.tool()
+    def sync_tracking_dataset(
+        target: str,
+        output_folder: str,
+        dataset_path: str | None = None,
+        login: str | None = None,
+        http_port: int = 32000,
+        name_type: str = "guess",
+    ) -> dict[str, Any]:
+        """Download a recorded Steam Frame tracking dataset directory into a local folder."""
+        ref = _device_ref(target, login, http_port, name_type)
+        return _run_tool(
+            operations,
+            "sync_tracking_dataset",
+            SafetyLevel.WRITE,
+            lambda: adapter.sync_tracking_dataset(ref, output_folder, dataset_path),
         )
 
     @mcp.tool()

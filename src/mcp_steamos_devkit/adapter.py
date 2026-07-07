@@ -141,6 +141,120 @@ class SteamOSDevkitAdapter:
             ],
         }
 
+    def adb_environment_conflict_doctor(self, host: str = "frame") -> dict[str, Any]:
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        def add_candidate(path: str | None) -> None:
+            if not path:
+                return
+            resolved = str(Path(path).expanduser())
+            key = resolved.lower() if platform.system() == "Windows" else resolved
+            if key not in seen:
+                seen.add(key)
+                candidates.append(resolved)
+
+        add_candidate(os.environ.get("ADB_PATH"))
+        add_candidate(self.layout.locate_adb())
+        default_sdk = os.environ.get("LOCALAPPDATA")
+        if default_sdk:
+            add_candidate(str(Path(default_sdk) / "Android/Sdk/platform-tools/adb.exe"))
+        path_hits: list[str] = []
+        where_cmd = ["where.exe", "adb"] if platform.system() == "Windows" else ["which", "-a", "adb"]
+        with contextlib.suppress(Exception):
+            proc = subprocess.run(
+                where_cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0,
+                check=False,
+            )
+            path_hits = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+            for line in path_hits:
+                add_candidate(line)
+
+        adb_versions: list[dict[str, Any]] = []
+        version_banners: set[str] = set()
+        for candidate in candidates:
+            exists = Path(candidate).is_file()
+            item: dict[str, Any] = {"path": candidate, "exists": exists}
+            if exists:
+                try:
+                    proc = subprocess.run(
+                        [candidate, "version"],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=10,
+                        creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0,
+                        check=False,
+                    )
+                    item.update(
+                        {
+                            "returncode": proc.returncode,
+                            "stdout": proc.stdout.splitlines(),
+                            "stderr": proc.stderr.splitlines(),
+                        }
+                    )
+                    if proc.stdout:
+                        version_banners.add("\n".join(proc.stdout.splitlines()[:2]))
+                except Exception as exc:
+                    item["error"] = str(exc)
+            adb_versions.append(item)
+
+        devices = None
+        adb = self.layout.locate_adb()
+        if adb:
+            with contextlib.suppress(Exception):
+                devices_result = self._run_adb(["devices", "-l"], timeout=10)
+                devices = {
+                    **devices_result,
+                    "parsed": _parse_adb_devices(devices_result.get("stdout", "")),
+                }
+
+        dns: dict[str, Any] = {"host": host, "ok": False}
+        try:
+            infos = socket.getaddrinfo(host, 5555, type=socket.SOCK_STREAM)
+            dns["ok"] = True
+            dns["addresses"] = sorted({item[4][0] for item in infos})
+        except OSError as exc:
+            dns["error"] = str(exc)
+
+        notes: list[str] = []
+        if len([item for item in adb_versions if item.get("exists")]) > 1:
+            notes.append("Multiple adb executables were found; mismatched server/client versions can confuse Unity or Android Studio.")
+        if len(version_banners) > 1:
+            notes.append("Detected more than one adb version banner.")
+        if devices:
+            parsed = devices.get("parsed") or []
+            tcp_5555 = [item for item in parsed if str(item.get("serial", "")).endswith(":5555")]
+            unauthorized = [item for item in parsed if item.get("state") != "device"]
+            if len(tcp_5555) > 1:
+                notes.append("Multiple TCP ADB targets on port 5555 are connected; choose a serial explicitly.")
+            if unauthorized:
+                notes.append("At least one ADB target is not in device state.")
+        if host and not dns.get("ok"):
+            notes.append("Host lookup failed; try the Steam Frame IP address directly if mDNS is unreliable.")
+
+        return {
+            "ok": not notes,
+            "host": host,
+            "env_adb_path": os.environ.get("ADB_PATH"),
+            "path_hits": path_hits,
+            "candidates": adb_versions,
+            "devices": devices,
+            "dns": dns,
+            "notes": notes,
+        }
+
     def ensure_ssh_key(self) -> dict[str, Any]:
         key_path = self.layout.ssh_key_path
         pubkey_path = self.layout.ssh_pubkey_path
@@ -465,6 +579,115 @@ class SteamOSDevkitAdapter:
             "source_obb": str(source),
             "staged_obb": str(expected_path),
             "validation": self.validate_android_split_package(str(root), apk_name),
+        }
+
+    def steampipe_android_release_preflight(
+        self,
+        local_dir: str,
+        apk_name: str | None = None,
+        app_id: str | None = None,
+        depot_id: str | None = None,
+        launch_executable: str | None = None,
+        cloud_subdirectory: str | None = None,
+    ) -> dict[str, Any]:
+        root = Path(local_dir).expanduser()
+        errors: list[str] = []
+        warnings: list[str] = []
+        manual: list[str] = []
+        if not root.is_dir():
+            raise DevkitAdapterError(f"Source directory does not exist: {root}")
+
+        apk: Path | None = None
+        apk_info: dict[str, Any] | None = None
+        with contextlib.suppress(DevkitAdapterError):
+            apk = self._select_top_level_apk(root, apk_name)
+        top_level_apks = sorted(root.glob("*.apk"))
+        nested_apks = sorted(path for path in root.rglob("*.apk") if path.parent != root)
+        root_obbs = sorted(root.glob("*.obb"))
+        obb_dir = root / "obb"
+        obb_files = sorted(obb_dir.rglob("*.obb")) if obb_dir.is_dir() else []
+
+        if apk is None:
+            if not top_level_apks:
+                errors.append("Steam Android depots need at least one top-level APK executable.")
+            else:
+                errors.append("Multiple top-level APKs found; pass apk_name or launch_executable.")
+        else:
+            with contextlib.suppress(DevkitAdapterError):
+                apk_info = self.inspect_android_apk(str(apk))
+        if nested_apks:
+            warnings.append("Nested APKs were found; Steam launch options expect a top-level APK executable.")
+        if root_obbs:
+            warnings.append("Root-level OBB files were found; Steam's Android layout expects OBBs under obb/.")
+        if obb_dir.exists() and not obb_dir.is_dir():
+            errors.append("obb exists but is not a directory.")
+
+        executable = launch_executable or (apk.name if apk else None)
+        if executable:
+            executable_path = root / executable
+            if executable_path.parent != root or executable_path.suffix.lower() != ".apk":
+                errors.append("Launch executable should be a top-level .apk path relative to the depot root.")
+            elif not executable_path.is_file():
+                errors.append(f"Launch executable was not found under depot root: {executable}")
+        else:
+            manual.append("Set a Steamworks Android launch option whose executable is the top-level APK.")
+
+        checklist = [
+            {
+                "item": "Application > General has Android checked under Supported Operating Systems",
+                "status": "manual",
+                "evidence": {"app_id": app_id},
+            },
+            {
+                "item": "SteamPipe depot used for this build has Operating System set to Android",
+                "status": "manual",
+                "evidence": {"depot_id": depot_id},
+            },
+            {
+                "item": "Depot root contains a top-level APK for the Android launch option",
+                "status": "ok" if apk and not errors else "error",
+                "evidence": {"apk": str(apk) if apk else None, "top_level_apks": [path.name for path in top_level_apks]},
+            },
+            {
+                "item": "Extra Android content is under obb/",
+                "status": "ok" if not root_obbs else "warning",
+                "evidence": {
+                    "root_obbs": [path.name for path in root_obbs],
+                    "obb_files": [str(path.relative_to(root)) for path in obb_files],
+                },
+            },
+            {
+                "item": "Steamworks launch option uses Operating System Android",
+                "status": "manual",
+                "evidence": {"launch_executable": executable},
+            },
+            {
+                "item": "Developer Comp or test package grants access to the Android depot",
+                "status": "manual",
+                "evidence": {"depot_id": depot_id},
+            },
+            {
+                "item": "Steam Cloud uses AndroidExternalData if Android saves need cloud sync",
+                "status": "manual" if not cloud_subdirectory else "ok",
+                "evidence": {"cloud_subdirectory": cloud_subdirectory},
+            },
+        ]
+
+        return {
+            "ok": not errors,
+            "local_dir": str(root),
+            "app_id": app_id,
+            "depot_id": depot_id,
+            "launch_executable": executable,
+            "apk_info": apk_info,
+            "errors": errors,
+            "warnings": warnings,
+            "manual_checks": manual,
+            "checklist": checklist,
+            "docs": [
+                "steamworks_docs_md/docs/steamhardware/steamframe/apk_upload.md",
+                "steamworks_docs_md/docs/sdk/uploading.md",
+            ],
         }
 
     def upload_title(self, profile: UploadProfile) -> dict[str, Any]:
@@ -1709,6 +1932,319 @@ print(json.dumps({"files": entries}))
 """,
         )
         return {"device": to_jsonable(device), **data}
+
+    def steam_frame_openxr_status(self, ref: DeviceRef) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        data = self._remote_python_json(
+            device,
+            r"""
+import json
+import os
+from pathlib import Path
+
+
+def inspect(path_text):
+    path = Path(path_text).expanduser()
+    item = {
+        "path": str(path),
+        "exists": path.exists(),
+        "is_symlink": path.is_symlink(),
+        "resolved": None,
+        "json": None,
+        "text": None,
+        "error": None,
+    }
+    try:
+        if path.is_symlink():
+            item["link_target"] = os.readlink(path)
+        item["resolved"] = str(path.resolve(strict=False))
+        if path.exists() and path.is_file():
+            text = path.read_text(encoding="utf-8", errors="replace")
+            item["text"] = text[:4000]
+            try:
+                item["json"] = json.loads(text)
+            except Exception:
+                pass
+    except OSError as exc:
+        item["error"] = str(exc)
+    return item
+
+
+home = Path.home()
+paths = {
+    "native_user_active_runtime": home / ".config/openxr/1/active_runtime.json",
+    "native_steamvr_runtime": Path("/opt/steamvr/steamxr_linuxarm64.json"),
+    "lepton_overlay_active_runtime": (
+        home
+        / ".local/share/Steam/steamapps/common/Lepton/images/rootfs_overlay/vendor/etc/openxr/1/active_runtime.json"
+    ),
+    "lepton_guestos_active_runtime": Path("/usr/share/guestos/android/vendor/etc/openxr/1/active_runtime.json"),
+}
+print(json.dumps({"paths": {key: inspect(str(path)) for key, path in paths.items()}}))
+""",
+        )
+        return {
+            "device": to_jsonable(device),
+            **data,
+            "notes": [
+                "Native SteamVR setup links ~/.config/openxr/1/active_runtime.json to the SteamVR runtime.",
+                "Lepton Android uses the vendor active_runtime.json mounted into the container.",
+            ],
+        }
+
+    def lepton_graphics_debug_status(self, ref: DeviceRef) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        data = self._remote_python_json(
+            device,
+            r"""
+import json
+import subprocess
+from pathlib import Path
+
+home = Path.home()
+lepton_root = home / ".local/share/Steam/steamapps/common/Lepton"
+helpers = {
+    "vulkan_layers": lepton_root / "liblepton/vulkan_layers.sh",
+    "renderdoc": lepton_root / "liblepton/renderdoc.sh",
+    "vulkan_validation": lepton_root / "liblepton/vulkan_validation.sh",
+    "fdm_injection": lepton_root / "liblepton/fdm_injection.sh",
+    "perfetto": lepton_root / "liblepton/perfetto.sh",
+    "strace": lepton_root / "liblepton/strace.sh",
+    "gdb": lepton_root / "liblepton/gdb.sh",
+}
+helper_status = {}
+for key, path in helpers.items():
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        helper_status[key] = {"exists": True, "path": str(path), "size": path.stat().st_size, "preview": text[:2000]}
+    except OSError as exc:
+        helper_status[key] = {"exists": path.exists(), "path": str(path), "error": str(exc)}
+
+layer_roots = [
+    Path("/usr/share/guestos/android/vendor/vulkan_layers"),
+    lepton_root / "vulkan_layers",
+]
+layers = {}
+for root in layer_roots:
+    entries = []
+    if root.is_dir():
+        for path in sorted(root.glob("*.so"))[:100]:
+            try:
+                entries.append({"name": path.name, "path": str(path), "size": path.stat().st_size})
+            except OSError:
+                entries.append({"name": path.name, "path": str(path)})
+    layers[str(root)] = {"exists": root.is_dir(), "entries": entries}
+
+special_files = {
+    "perfetto_tracebox": Path("/usr/share/guestos/android/perfetto/tracebox"),
+    "renderdoc_android_apk": Path("/usr/share/renderdoc/plugins/android/org.renderdoc.renderdoccmd.arm64.apk"),
+}
+files = {}
+for key, path in special_files.items():
+    try:
+        files[key] = {"exists": path.exists(), "path": str(path), "size": path.stat().st_size if path.exists() else None}
+    except OSError as exc:
+        files[key] = {"exists": path.exists(), "path": str(path), "error": str(exc)}
+
+mesa = subprocess.run(["mesa_version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False, timeout=10)
+print(
+    json.dumps(
+        {
+            "helpers": helper_status,
+            "vulkan_layers": layers,
+            "files": files,
+            "mesa_version": {
+                "returncode": mesa.returncode,
+                "stdout": mesa.stdout.strip(),
+                "stderr": mesa.stderr.strip(),
+            },
+            "env_flags": {
+                "renderdoc": ["ENABLE_VULKAN_RENDERDOC_CAPTURE", "VK_INSTANCE_LAYERS=VK_LAYER_RENDERDOC_Capture"],
+                "validation": ["ENABLE_VULKAN_VALIDATION_LAYER"],
+                "fdm": ["ENABLE_VULKAN_FDM_INJECTION_LAYER"],
+                "rpo": ["ENABLE_VULKAN_RPO_LAYER"],
+                "frame_markers": ["EnableFrameEndMarkers"],
+                "timeline": ["DisableTimelineSemaphoreWait"],
+                "strace": ["LEPTON_STRACE", "LEPTON_STRACE_ARGS"],
+            },
+        }
+    )
+)
+""",
+        )
+        return {
+            "device": to_jsonable(device),
+            **data,
+            "notes": [
+                "This is a readiness/status probe; it does not enable layers or install debug packages.",
+                "RenderDoc and Vulkan layer activation should be done through launch settings or gated tools.",
+            ],
+        }
+
+    def lepton_artifacts_manifest(
+        self,
+        ref: DeviceRef,
+        context: str = "dev",
+        package_name: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        clean_context = self._validate_lepton_context(context)
+        if package_name and not ANDROID_PACKAGE_RE.fullmatch(package_name):
+            raise DevkitAdapterError(f"Invalid Android package name: {package_name}")
+        bounded_limit = min(max(int(limit), 1), 500)
+        data = self._remote_python_json(
+            device,
+            "CONTEXT = "
+            + json.dumps(clean_context)
+            + "\nPACKAGE_NAME = "
+            + json.dumps(package_name or "")
+            + "\nLIMIT = "
+            + str(bounded_limit)
+            + r"""
+import fnmatch
+import json
+from pathlib import Path
+
+home = Path.home()
+lepton_root = home / ".local/share/Steam/steamapps/common/Lepton"
+roots = [
+    Path("/tmp"),
+    lepton_root / "perfetto",
+    home / ".local/share/Steam/logs",
+    home / ".config/openvr/logs",
+]
+patterns = [
+    f"lepton-{CONTEXT}*.pftrace",
+    f"lepton-{CONTEXT}.log",
+    f"*{CONTEXT}*perfetto*",
+    f"*{CONTEXT}*bootchart*",
+    f"*{CONTEXT}*strace*",
+]
+if PACKAGE_NAME:
+    patterns += [
+        f"*{PACKAGE_NAME}*",
+        f"strace-{PACKAGE_NAME}.log",
+        f"strace-{PACKAGE_NAME}.debug",
+    ]
+
+entries = []
+for root in roots:
+    if not root.exists():
+        continue
+    try:
+        candidates = [path for path in root.rglob("*") if path.is_file()]
+    except OSError:
+        continue
+    for path in candidates:
+        rel = path.name
+        full = str(path)
+        if not any(fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(full, pattern) for pattern in patterns):
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        entries.append(
+            {
+                "path": str(path),
+                "root": str(root),
+                "size": stat.st_size,
+                "mtime": stat.st_mtime,
+            }
+        )
+entries.sort(key=lambda item: item["mtime"], reverse=True)
+print(json.dumps({"context": CONTEXT, "package_name": PACKAGE_NAME or None, "limit": LIMIT, "entries": entries[:LIMIT]}))
+""",
+        )
+        return {
+            "device": to_jsonable(device),
+            **data,
+            "notes": [
+                "Lepton perfetto traces are typically /tmp/lepton-<context>-*.pftrace.",
+                "Strace/debug files are only present after a launch configured with Lepton strace flags.",
+            ],
+        }
+
+    def steam_frame_tracking_datasets(self, ref: DeviceRef, limit: int = 10) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        bounded_limit = min(max(int(limit), 1), 100)
+        data = self._remote_python_json(
+            device,
+            "LIMIT = " + str(bounded_limit) + r"""
+import json
+from pathlib import Path
+
+root = Path.home() / ".config/openvr/config/cv/xrservice/datasets"
+entries = []
+if root.is_dir():
+    for path in sorted(root.iterdir(), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True):
+        if not path.is_dir():
+            continue
+        try:
+            stat = path.stat()
+            file_count = 0
+            total_bytes = 0
+            for child in path.rglob("*"):
+                if child.is_file():
+                    file_count += 1
+                    total_bytes += child.stat().st_size
+        except OSError:
+            continue
+        entries.append(
+            {
+                "path": str(path),
+                "name": path.name,
+                "mtime": stat.st_mtime,
+                "file_count": file_count,
+                "total_bytes": total_bytes,
+            }
+        )
+print(json.dumps({"root": str(root), "exists": root.is_dir(), "limit": LIMIT, "datasets": entries[:LIMIT]}))
+""",
+        )
+        return {
+            "device": to_jsonable(device),
+            **data,
+            "notes": [
+                "Tracking datasets are created from SteamVR Developer settings on the headset.",
+                "Use sync_tracking_dataset to download one after recording.",
+            ],
+        }
+
+    def sync_tracking_dataset(
+        self,
+        ref: DeviceRef,
+        output_folder: str,
+        dataset_path: str | None = None,
+    ) -> dict[str, Any]:
+        device = self.resolve_device(ref)
+        manifest = self.steam_frame_tracking_datasets(ref, limit=100)
+        datasets = manifest.get("datasets") or []
+        if not datasets:
+            raise DevkitAdapterError("No tracking datasets were found on the device")
+        root = str(manifest.get("root") or "")
+        selected = None
+        if dataset_path:
+            requested = dataset_path.strip().rstrip("/")
+            for item in datasets:
+                if item.get("path", "").rstrip("/") == requested or item.get("name") == requested:
+                    selected = item
+                    break
+            if selected is None:
+                raise DevkitAdapterError(f"Dataset path/name was not found under {root}: {dataset_path}")
+        else:
+            selected = datasets[0]
+        remote_path = str(selected["path"])
+        if not remote_path.startswith(root.rstrip("/") + "/"):
+            raise DevkitAdapterError(f"Refusing to download dataset outside expected root: {remote_path}")
+        transfer = self.rsync_transfer(output_folder, device, remote_path, upload=False)
+        return {
+            "device": to_jsonable(device),
+            "dataset": selected,
+            "local_folder": str(Path(output_folder).expanduser()),
+            "transfer": transfer,
+        }
 
     def steam_services(
         self,
